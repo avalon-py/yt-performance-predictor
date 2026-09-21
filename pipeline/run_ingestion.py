@@ -10,6 +10,9 @@ import os
 import csv
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()  # must run before importing ingestion.youtube_client, which reads the API key at import time
+
 import pandas as pd
 
 from ingestion.youtube_client import get_channel_info, get_video_ids, get_video_details, get_category_name
@@ -20,19 +23,22 @@ from features.trailing_views import compute_trailing_views
 
 # Fill with channel handles (e.g. "@mkbhd") or raw channel IDs (UC...).
 CHANNELS = [
-    "@example_channel_1",
-    "@example_channel_2",
-    # ... your list of 100 goes here
+    "@MrBeast",
+    "@jacksepticeye",
+    "@ludwig",
+    "@Wifies",
+    "@mkbhd",
 ]
 
 PUBLISHED_AFTER = "2025-01-01T00:00:00Z"
 LABEL_MATURITY_DAYS = 28
+SHORTS_MAX_DURATION_SECONDS = 180  # skip anything at or under this length
 OUTPUT_DIR = "data"
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
 CSV_PATH = os.path.join(OUTPUT_DIR, "videos.csv")
 
 
-def process_channel(channel_ref, rows):
+def process_channel(channel_ref, rows, skipped_shorts):
     print(f"Processing {channel_ref}...")
     info = get_channel_info(channel_ref)
     if info is None:
@@ -56,6 +62,11 @@ def process_channel(channel_ref, rows):
         age_days = (now - pub_dt).days
 
         duration_seconds = parse_duration_iso8601_to_seconds(content["duration"])
+
+        if duration_seconds <= SHORTS_MAX_DURATION_SECONDS:
+            skipped_shorts[0] += 1
+            continue  # skip Shorts entirely -- no thumbnail download, no row
+
         views = int(stats.get("viewCount", 0))
         genre = get_category_name(snippet.get("categoryId"))
 
@@ -72,7 +83,6 @@ def process_channel(channel_ref, rows):
             "title": snippet["title"],
             "published_at": published_at,
             "duration_seconds": duration_seconds,
-            "is_short": duration_seconds <= 180,
             "views": views,
             "label_finalized": age_days >= LABEL_MATURITY_DAYS,
             "subscriber_count_at_upload": sub_count_at_upload,
@@ -85,9 +95,10 @@ def process_channel(channel_ref, rows):
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     rows = []
+    skipped_shorts = [0]  # mutable counter shared across process_channel calls
     for channel_ref in CHANNELS:
         try:
-            process_channel(channel_ref, rows)
+            process_channel(channel_ref, rows, skipped_shorts)
         except Exception as e:
             print(f"  [error] {channel_ref}: {e}")
 
@@ -95,6 +106,7 @@ def main():
     df = compute_trailing_views(df)
     df.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_MINIMAL)
     print(f"\nDone. {len(df)} rows written to {CSV_PATH}")
+    print(f"Skipped {skipped_shorts[0]} Shorts (<= {SHORTS_MAX_DURATION_SECONDS}s)")
     print(f"Images saved to {IMAGES_DIR}/")
 
 
