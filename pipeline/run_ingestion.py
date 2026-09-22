@@ -48,7 +48,13 @@ def process_channel(channel_ref, rows, skipped_shorts):
     channel_id, uploads_playlist_id, subscriber_count = info
 
     video_ids = get_video_ids(uploads_playlist_id, PUBLISHED_AFTER)
-    print(f"  found {len(video_ids)} videos since {PUBLISHED_AFTER}")
+    already_finalized = [v for v in video_ids if v in finalized_ids]
+    video_ids = [v for v in video_ids if v not in finalized_ids]
+    print(f"  found {len(video_ids) + len(already_finalized)} videos since {PUBLISHED_AFTER} "
+          f"({len(already_finalized)} already finalized, skipping their videos.list fetch)")
+
+    if not video_ids:
+        return
 
     details = get_video_details(video_ids)
     now = datetime.now(timezone.utc)
@@ -102,7 +108,7 @@ def main():
     skipped_shorts = [0]
     for channel_ref in channels:
         try:
-            process_channel(channel_ref, rows, skipped_shorts)
+            process_channel(channel_ref, rows, skipped_shorts, finalized_ids)
         except Exception as e:
             print(f"  [error] {channel_ref}: {e}")
 
