@@ -31,6 +31,7 @@ EPOCHS = 30
 LEARNING_RATE = 1e-3
 VAL_FRACTION = 0.15
 TEST_FRACTION = 0.15
+EARLY_STOP_PATIENCE = 5  # stop if val_loss hasn't improved in this many epochs
 
 
 def load_data():
@@ -150,6 +151,7 @@ def main():
     loss_fn = torch.nn.HuberLoss()  # more robust to view-count outliers than MSE
 
     best_val_loss = float("inf")
+    epochs_without_improvement = 0
     os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
     for epoch in range(1, EPOCHS + 1):
@@ -159,6 +161,7 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "genre_categories": genre_categories,
@@ -167,9 +170,14 @@ def main():
                 "text_dim": text_embeddings.shape[1],
                 "tabular_dim": train_tabular.shape[1],
             }, CHECKPOINT_PATH)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= EARLY_STOP_PATIENCE:
+                print(f"No val_loss improvement in {EARLY_STOP_PATIENCE} epochs -- stopping early.")
+                break
 
     # Final test evaluation using the best checkpoint, not just the last epoch
-    checkpoint = torch.load(CHECKPOINT_PATH)
+    checkpoint = torch.load(CHECKPOINT_PATH, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_loss, preds, targets = evaluate(model, test_loader, loss_fn, device)
 

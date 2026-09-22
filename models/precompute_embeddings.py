@@ -15,13 +15,13 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from torchvision import models, transforms
+from torchvision import transforms
 from PIL import Image
 from sentence_transformers import SentenceTransformer
 
 CSV_PATH = "data/videos.csv"
 EMBEDDINGS_DIR = "data/embeddings"
-IMAGE_EMBED_DIM = 768  # ConvNeXt-tiny's pooled output dim
+IMAGE_EMBED_DIM = 384  # DINOv2 ViT-S/14's output dim (no "tiny" variant exists -- S is smallest)
 TEXT_MODEL_NAME = "all-MiniLM-L6-v2"
 
 IMAGE_TRANSFORM = transforms.Compose([
@@ -32,8 +32,9 @@ IMAGE_TRANSFORM = transforms.Compose([
 
 
 def build_image_encoder():
-    model = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
-    model.classifier = torch.nn.Identity()  # strip the classification head, keep pooled features
+    # Self-supervised features (no ImageNet-category bottleneck) -- a better fit
+    # than a supervised classifier backbone for a "will this get clicked" task.
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
     model.eval()
     for p in model.parameters():
         p.requires_grad = False  # frozen for v1
@@ -51,7 +52,7 @@ def embed_images(df, image_encoder, batch_size=32):
             return
         with torch.no_grad():
             batch_tensor = torch.stack(batch_imgs)
-            out = image_encoder(batch_tensor).squeeze(-1).squeeze(-1).numpy()
+            out = image_encoder(batch_tensor).numpy()  # DINOv2 returns (batch, 384) directly
         for i, idx in enumerate(batch_idxs):
             embeddings[idx] = out[i]
             valid_mask[idx] = True

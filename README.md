@@ -1,97 +1,132 @@
-# YouTube Views Predictor
+# yt-performance-predictor
 
-Predicting how well a YouTube video will perform — using only its thumbnail, title, and metadata available **before or at publish time**. No leakage from likes, comments, or post-publish signals.
+Predicts how a YouTube video will perform (views, relative to the channel's own baseline) from its **thumbnail + title alone, before it's published** — with a continuous training pipeline that keeps the model current as new data arrives.
 
-## Idea
+## Why this exists
 
-Given a video's thumbnail, title, and channel/tabular metadata, predict its relative view performance (vs. the channel's own baseline) at a fixed horizon after publishing.
+Most "will this thumbnail work" tools are black boxes. This project builds one end-to-end: real data ingestion, honest handling of the messy parts (delayed labels, channel-size normalization, staleness), a multimodal deep learning model, and a plan to run it as a continuously retrained production system rather than a one-off notebook.
 
-## Approach
+## What it predicts
 
-- **v1 — Late fusion**: separate pretrained encoders for the thumbnail (image) and title (text), concatenated into a small fusion head (MLP/regressor). Ships first — simpler, reuses transfer learning, gets the full pipeline working end-to-end.
-- **v2 — Early fusion**: a single transformer with cross-attention between image patches and text tokens, trained on the accumulated dataset once there's enough volume. Warm-started from the same pretrained encoders where possible.
-
-The project deliberately builds both, in sequence, and reports the comparison as the main technical result — not just "which model is better" but "when is the added complexity of cross-modal attention worth it."
-
-## Features
-
-**Image branch:** thumbnail pixels → CNN/ViT encoder
-
-**Text branch:** title → text encoder. Description is reduced to engineered features (hashtag count, link count, length) rather than fed raw — weak/noisy signal.
-
-**Tabular branch:**
-- Channel subscriber count *at publish time*
-- Channel's rolling average views over last N uploads (normalization baseline)
-- Channel upload frequency (videos/week)
-- Category/genre ID
-- Duration + `is_short` flag
-- Day-of-week and hour published
-- Tag count
-- Title length, word count, has-number, has-question-mark, all-caps ratio
-- *(optional)* face detection on thumbnail: has-face, face count, text-overlay present
-
-**Not used as features:** likes, comments — these accumulate on the same timeline as views, so using them as inputs is leakage.
-
-## Target
+Given a **thumbnail image + title** (known before publish), predict the video's **relative performance** — how it will do compared to that channel's own recent average, not raw view count. Raw views are dominated by channel size; normalizing against the channel's own baseline isolates the effect of the thumbnail/title itself.
 
 ```
-log(views + 1) − log(channel_baseline + 1)
+target = log(1 + views) − log(1 + trailing_avg_views)
 ```
-at a fixed horizon (e.g. 48h post-publish).
 
-## Data Strategy
+Where `trailing_avg_views` is the channel's average views over its N most recent prior uploads — computed causally (only videos published *before* the one in question), so it's genuinely available at prediction time with no leakage.
 
-- **Backfill**: pull channels' full upload history via `playlistItems.list` (1 unit/call). Older videos have effectively "final" view counts — fast way to get tens of thousands of rows on day one.
-- **Live stream**: an Airflow DAG captures new uploads at t=0 and snapshots the true label at exactly the target horizon — slower but exact.
-
-Rough row targets: ~5,000–10,000 for v1 (late fusion), ~30,000–50,000+ for v2 (early fusion).
-
-## Data Source
-
-[YouTube Data API v3](https://developers.google.com/youtube/v3) — free tier, 10,000 units/day.
-
-- `playlistItems.list` (1 unit) — new video IDs from a channel's uploads playlist
-- `videos.list` (1 unit) — stats/metadata/thumbnails, up to 50 videos per call
-- `search.list` (100 units) — avoided; too expensive for this use case
-
-## Project Structure
+## Pipeline overview
 
 ```
-.
-├── ingestion/      # YouTube API client, backfill + live polling scripts
-├── features/       # feature engineering (tabular, title, thumbnail preprocessing)
-├── models/         # late-fusion (v1) and early-fusion (v2) model code
-├── pipeline/        # Airflow DAG / orchestration for continuous data collection
-├── data/           # raw + processed data (gitignored)
-├── .env            # YOUTUBE_API_KEY (gitignored)
-└── requirements.txt
+YouTube Data API v3  ──►  ingestion/  ──►  data/videos.csv + data/images/
+                                              │
+                                              ▼
+                                    features/ (title stats, trailing views)
+                                              │
+                                              ▼
+                              models/precompute_embeddings.py
+                              (frozen DINOv2 + MiniLM, cached once)
+                                              │
+                                              ▼
+                                     models/train.py
+                              (late fusion head, time-based split)
+```
+
+## Data
+
+- **Source:** YouTube Data API v3 (`playlistItems.list` + `videos.list`, cheap endpoints — avoid `search.list`, which costs 100x more quota per call).
+- **Scope:** ~100 English-speaking channels, hand-curated to exclude channels where views are driven by external events rather than thumbnail/title choice (news channels, official music/artist channels tied to release calendars). Personality, gaming, commentary, and entertainment channels are the target profile.
+- **Window:** videos published from **2025-01-01 onward**.
+- **Shorts excluded:** anything ≤180s duration is filtered out before download/storage — Shorts are discovered completely differently (feed-driven) and don't share the same performance dynamics as long-form video.
+- **Storage:** local disk for now (`data/images/{video_id}.jpg`, `data/videos.csv`). Raw images are kept as source of truth rather than only storing embeddings, so encoders can be swapped or fine-tuned later without re-downloading.
+
+### Fields retrieved vs. derived
+
+| Retrieved (API) | Derived (computed locally) |
+|---|---|
+| Thumbnail image | Title length, word count |
+| Title (raw text) | Capitalized-word count, capitalized-letter count & ratio |
+| Views | Symbol count, has-question-mark, has-number |
+| Subscriber count | Trailing average views (rolling, shifted to prevent leakage) |
+| `categoryId` → genre | `is_first_video` flag (no prior videos in window) |
+| Duration, publish date | |
+
+### Known limitations (tracked, not hidden)
+
+- **`subscriber_count_at_upload` is actually current subscriber count**, not the true value at publish time. A TubeCensus integration (historical subscriber snapshots via Wayback Machine data) was attempted and shelved — real package, but required ~20GB local storage and hit Windows permission issues with diminishing returns for a v1. Revisit later if this proves to matter; a coarse tier bucket (e.g. `<100K / 100K-1M / 1M-5M / ...`) is a cheap partial fix if needed, since it's far less sensitive to staleness than an exact number.
+- **Delayed labeling:** a video's view count isn't "final" the moment it's published. Rows are only used for training once `label_finalized = True`, which flips after ~28 days. Views are refreshed on a decreasing cadence as a video ages (always for <2 months old, checked for >5% change for 2-6 months, never touched beyond 6 months) — but once `label_finalized` flips, that row's views are never rewritten again, ever, for reproducibility.
+- **`is_first_video`** means "first video *in our fetched 2025+ window*" for that channel, not literally the channel's first upload ever — there's no trailing-views signal available for these regardless of channel age, since earlier history wasn't pulled.
+- Ingestion re-runs are **idempotent and incremental**: thumbnails are skipped if already downloaded, and already-finalized `video_id`s are excluded from the `videos.list` fetch entirely (not just discarded after fetching), so quota cost scales with what's actually new, not total dataset size.
+
+## Model — v1: Late Fusion
+
+Three independent branches, each with its own frozen pretrained encoder, projected and concatenated before a small regression head:
+
+- **Image branch:** DINOv2 ViT-S/14 (self-supervised, 384-dim) — chosen over a supervised ImageNet backbone (e.g. ConvNeXt) because supervised features are compressed around 1,000-category object discrimination, discarding compositional/aesthetic signal (color, contrast, framing) that plausibly matters more for thumbnail performance than "what object is this."
+- **Text branch:** `all-MiniLM-L6-v2` sentence embedding (384-dim) on the title.
+- **Tabular branch:** subscriber count (log-scaled), trailing average views (log-scaled), duration, title-derived stats, one-hot genre.
+- **Fusion:** each branch → its own small projection layer → concatenated → MLP regression head → single scalar (the relative-performance target).
+
+Both encoders are **fully frozen** in v1 — only the projections and fusion head are trained. Embeddings are precomputed once (`models/precompute_embeddings.py`) and cached, since frozen encoders produce the same output every epoch; re-running them repeatedly during training would be pure waste.
+
+**Split:** time-based (train on earliest videos, validate/test on most recent finalized ones) — matches real deployment (predicting forward) and avoids random-split leakage across near-duplicate time windows.
+
+**Loss:** Huber (robust to view-count outliers). **Early stopping** on validation loss (patience=5) to avoid training past the overfitting point — only the best checkpoint by val loss is kept.
+
+**Evaluation metrics:**
+- RMSE, converted back to raw view-count space via `invert_target`
+- **Spearman rank correlation** between predicted and actual relative performance — arguably the more honest metric for this task, since the real use case ("will thumbnail A beat thumbnail B") is fundamentally a ranking question, not a point-estimate one.
+
+## Planned — v2: Early Fusion
+
+Once v1's pipeline is proven and enough data has accumulated, build a cross-attention transformer over image patch tokens + title tokens jointly (rather than separately-pooled embeddings), to capture thumbnail/title *mismatch* signals late fusion can't see (e.g. clickbait where the two don't agree). Compared empirically against v1 on the same accumulated dataset — architecture choice justified by measured improvement, not assumed.
+
+## Planned — Continuous Training Infrastructure
+
+- **Orchestration:** Airflow DAGs for scheduled ingestion, delayed-label refresh, and retraining triggers.
+- **Compute:** Docker containers on AWS EC2 (spot instances for training cost control).
+- **Drift monitoring:** track prediction error and feature distributions over time; YouTube's algorithm and audience behavior genuinely shift over months, giving real (not synthetic) retraining triggers.
+- **Storage at scale:** S3 for images, Postgres (self-hosted on the same EC2 instance, or RDS free tier) for structured data — deliberately avoiding a second managed-service vendor (Supabase/Oracle/Neon were evaluated and dropped) since consolidating onto one cloud reduces operational surface area without a compelling technical reason to split it.
+- **Serving:** FastAPI + Docker, with the encoders exported to ONNX and quantized (fp16/int8) for a lightweight, free-tier-friendly deployment footprint — same technique already used in a prior project (Speech2Market) to hit a memory-constrained deployment target.
+
+## Repo structure
+
+```
+ingestion/          YouTube API client, thumbnail downloader, subscriber lookup
+features/           Title feature engineering, trailing views, target computation
+pipeline/           Orchestration script tying ingestion + features together
+models/             Embedding precomputation, dataset, late fusion architecture, training
+data/                Local dataset output (gitignored: images/, videos.csv, embeddings/)
 ```
 
 ## Setup
 
 ```bash
-git clone https://github.com/avalon-py/<repo-name>.git
-cd <repo-name>
-python -m venv venv
-source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-Add your API key to `.env`:
+Set in `.env` (loaded via `python-dotenv`, must load before any project imports):
 ```
 YOUTUBE_API_KEY=your_key_here
 ```
 
+## Running it
+
+```bash
+# 1. Ingest data (incremental -- safe to re-run as CHANNELS grows)
+python -m pipeline.run_ingestion
+
+# 2. Sanity-check the model architecture (no data or pretrained weights needed)
+python models/late_fusion_model.py
+
+# 3. Precompute frozen embeddings (one-time, or after adding new data)
+python -m models.precompute_embeddings
+
+# 4. Train
+python -m models.train
+```
+
 ## Status
 
-🚧 Early stage — setting up ingestion pipeline.
-
-## Roadmap
-
-- [ ] YouTube API client with quota tracking
-- [ ] Backfill script (historical upload data)
-- [ ] Feature engineering pipeline
-- [ ] v1 late-fusion model
-- [ ] Live Airflow DAG for continuous labeling
-- [ ] v2 early-fusion model
-- [ ] v1 vs v2 comparison report
+v1 late fusion model runs end-to-end on ~6,800 finalized rows. Actively iterating on regularization (dropout/weight decay) to address overfitting observed after ~epoch 7 on the first full run.
