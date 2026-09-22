@@ -3,3 +3,4 @@ yt-performance-predictor
 __pycache__/
 *.pyc
 data/
+.cache/

@@ -13,8 +13,8 @@ import torch.nn as nn
 
 class LateFusionModel(nn.Module):
     def __init__(self, image_dim, text_dim, tabular_dim,
-                 proj_dim=256, tabular_proj_dim=64, dropout=0.3,
-                 embedding_noise_std=0.03):
+                 proj_dim=256, tabular_proj_dim=64, dropout=0.15,
+                 embedding_noise_std=0.05):
         super().__init__()
         self.embedding_noise_std = embedding_noise_std
 
@@ -36,10 +36,10 @@ class LateFusionModel(nn.Module):
 
         fusion_input_dim = proj_dim * 2 + tabular_proj_dim
         self.fusion_head = nn.Sequential(
-            nn.Linear(fusion_input_dim, 64),   # shrunk from 128 -- less capacity to memorize noise
+            nn.Linear(fusion_input_dim, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 16),                  # shrunk from 32
+            nn.Linear(64, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
         )

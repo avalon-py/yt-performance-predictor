@@ -13,8 +13,13 @@ TABULAR_NUMERIC_COLS = [
     "duration_seconds", "title_length_chars", "title_word_count",
     "title_capitalized_word_count", "title_capitalized_letter_count",
     "title_capitalized_letter_ratio", "title_symbol_count",
+    "face_count", "mean_saturation", "mean_brightness",
+    "brightness_std", "warm_hue_ratio",
 ]
-TABULAR_BOOL_COLS = ["title_has_question_mark", "title_has_number"]
+TABULAR_BOOL_COLS = [
+    "title_has_question_mark", "title_has_number",
+    "has_face", "has_text_overlay",
+]
 
 
 def build_tabular_matrix(df, genre_categories, scaler=None, fit_scaler=False):

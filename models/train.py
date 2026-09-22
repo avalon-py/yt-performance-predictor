@@ -23,6 +23,7 @@ from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS,
 from models.late_fusion_model import LateFusionModel
 
 CSV_PATH = "data/videos.csv"
+VISUAL_FEATURES_PATH = "data/visual_features.csv"
 EMBEDDINGS_DIR = "data/embeddings"
 CHECKPOINT_PATH = "models/checkpoints/late_fusion_v1.pt"
 
@@ -38,6 +39,14 @@ def load_data():
     df = pd.read_csv(CSV_PATH)
     df["label_finalized"] = df["label_finalized"].astype(str) == "True"
 
+    if not os.path.exists(VISUAL_FEATURES_PATH):
+        raise RuntimeError(
+            f"{VISUAL_FEATURES_PATH} not found -- run "
+            "`python -m models.precompute_visual_features` first."
+        )
+    visual = pd.read_csv(VISUAL_FEATURES_PATH)
+    df = df.merge(visual, on="video_id", how="left")  # left join -- rows not yet processed become NaN, filtered below
+
     image_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "image_embeddings.npy"))
     text_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "text_embeddings.npy"))
     valid_image_mask = np.load(os.path.join(EMBEDDINGS_DIR, "valid_image_mask.npy"))
@@ -46,20 +55,26 @@ def load_data():
     df = df.merge(video_id_order.reset_index().rename(columns={"index": "_embed_idx"}), on="video_id")
     df = df.sort_values("_embed_idx").reset_index(drop=True)
 
-    # Only rows that are: finalized, have a valid image embedding, and have
-    # a real trailing-views value (drops each channel's first-in-window video)
+    # Only rows that are: finalized, have a valid image embedding, have a real
+    # trailing-views value, and have visual features already computed
     mask = (
         df["label_finalized"]
         & valid_image_mask[df["_embed_idx"].values]
         & df["trailing_avg_views"].notna()
+        & df["has_face"].notna()
     )
     print(f"Using {mask.sum()}/{len(df)} rows after filtering "
-          f"(finalized + valid image + has trailing_avg_views)")
+          f"(finalized + valid image + has trailing_avg_views + has visual features)")
 
     df = df[mask].reset_index(drop=True)
     idxs = df["_embed_idx"].values
     image_embeddings = image_embeddings[idxs]
     text_embeddings = text_embeddings[idxs]
+
+    # Safe to convert now -- every remaining row already passed the notna()
+    # check above, so no NaN-to-string ambiguity to worry about here
+    df["has_face"] = df["has_face"].astype(str) == "True"
+    df["has_text_overlay"] = df["has_text_overlay"].astype(str) == "True"
 
     df["target"] = compute_target(df["views"], df["trailing_avg_views"])
 
