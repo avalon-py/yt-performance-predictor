@@ -147,7 +147,7 @@ def main():
         tabular_dim=train_tabular.shape[1],
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     loss_fn = torch.nn.HuberLoss()  # more robust to view-count outliers than MSE
 
     best_val_loss = float("inf")

@@ -13,8 +13,10 @@ import torch.nn as nn
 
 class LateFusionModel(nn.Module):
     def __init__(self, image_dim, text_dim, tabular_dim,
-                 proj_dim=256, tabular_proj_dim=64, dropout=0.3):
+                 proj_dim=256, tabular_proj_dim=64, dropout=0.3,
+                 embedding_noise_std=0.03):
         super().__init__()
+        self.embedding_noise_std = embedding_noise_std
 
         self.image_proj = nn.Sequential(
             nn.Linear(image_dim, proj_dim),
@@ -34,15 +36,19 @@ class LateFusionModel(nn.Module):
 
         fusion_input_dim = proj_dim * 2 + tabular_proj_dim
         self.fusion_head = nn.Sequential(
-            nn.Linear(fusion_input_dim, 128),
+            nn.Linear(fusion_input_dim, 64),   # shrunk from 128 -- less capacity to memorize noise
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 32),
+            nn.Linear(64, 16),                  # shrunk from 32
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(16, 1),
         )
 
     def forward(self, image_embedding, text_embedding, tabular):
+        if self.training and self.embedding_noise_std > 0:
+            image_embedding = image_embedding + torch.randn_like(image_embedding) * self.embedding_noise_std
+            text_embedding = text_embedding + torch.randn_like(text_embedding) * self.embedding_noise_std
+
         img = self.image_proj(image_embedding)
         txt = self.text_proj(text_embedding)
         tab = self.tabular_proj(tabular)
@@ -51,7 +57,6 @@ class LateFusionModel(nn.Module):
 
 
 if __name__ == "__main__":
-    # Quick shape sanity check with synthetic tensors -- no pretrained weights needed.
     batch_size = 8
     image_dim, text_dim, tabular_dim = 768, 384, 15
 

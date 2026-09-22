@@ -21,7 +21,7 @@ from sentence_transformers import SentenceTransformer
 
 CSV_PATH = "data/videos.csv"
 EMBEDDINGS_DIR = "data/embeddings"
-IMAGE_EMBED_DIM = 384  # DINOv2 ViT-S/14's output dim (no "tiny" variant exists -- S is smallest)
+IMAGE_EMBED_DIM = 384
 TEXT_MODEL_NAME = "all-MiniLM-L6-v2"
 
 IMAGE_TRANSFORM = transforms.Compose([

@@ -8,10 +8,12 @@ Usage:
 
 import os
 import csv
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()  # must run before importing ingestion.youtube_client, which reads the API key at import time
+load_dotenv()
 
 import pandas as pd
 
@@ -21,21 +23,21 @@ from ingestion.tubecensus_client import get_subscriber_count_at
 from features.title_features import parse_duration_iso8601_to_seconds, title_features
 from features.trailing_views import compute_trailing_views
 
-# Fill with channel handles (e.g. "@mkbhd") or raw channel IDs (UC...).
-CHANNELS = [
-    "@MrBeast",
-    "@jacksepticeye",
-    "@ludwig",
-    "@Wifies",
-    "@mkbhd",
-]
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "channels.json")
 PUBLISHED_AFTER = "2025-01-01T00:00:00Z"
 LABEL_MATURITY_DAYS = 28
-SHORTS_MAX_DURATION_SECONDS = 180  # skip anything at or under this length
+SHORTS_MAX_DURATION_SECONDS = 180
 OUTPUT_DIR = "data"
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
 CSV_PATH = os.path.join(OUTPUT_DIR, "videos.csv")
+
+
+def load_channels(config_path=CONFIG_PATH):
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def process_channel(channel_ref, rows, skipped_shorts):
@@ -94,21 +96,29 @@ def process_channel(channel_ref, rows, skipped_shorts):
 
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
+    channels = load_channels()
+    
     rows = []
-    skipped_shorts = [0]  # mutable counter shared across process_channel calls
-    for channel_ref in CHANNELS:
+    skipped_shorts = [0]
+    for channel_ref in channels:
         try:
             process_channel(channel_ref, rows, skipped_shorts)
         except Exception as e:
             print(f"  [error] {channel_ref}: {e}")
 
     df = pd.DataFrame(rows)
-    df = compute_trailing_views(df)
+    if not df.empty:
+        df = compute_trailing_views(df)
+
+    if os.path.exists(CSV_PATH):
+        existing = pd.read_csv(CSV_PATH)
+        existing = existing[~existing["video_id"].isin(df["video_id"])]
+        df = pd.concat([existing, df], ignore_index=True)
+
     df.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_MINIMAL)
     print(f"\nDone. {len(df)} rows written to {CSV_PATH}")
     print(f"Skipped {skipped_shorts[0]} Shorts (<= {SHORTS_MAX_DURATION_SECONDS}s)")
     print(f"Images saved to {IMAGES_DIR}/")
-
 
 if __name__ == "__main__":
     main()
