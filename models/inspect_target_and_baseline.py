@@ -92,7 +92,7 @@ def inspect_top_test_errors(df, test_idx, predicted_views, actual_views, top_n=1
         print()
 
 
-def run_tabular_only_baseline(df, train_idx, test_idx):
+def run_tabular_only_baseline(df, train_idx, test_idx, lgbm_with_embed_rho=None):
     print("=== Baseline: tabular features ONLY (no embeddings at all) ===")
     genre_categories = sorted(df.iloc[train_idx]["genre"].dropna().unique().tolist())
     train_tab, scaler = build_tabular_matrix(df.iloc[train_idx], genre_categories, fit_scaler=True)
@@ -108,38 +108,50 @@ def run_tabular_only_baseline(df, train_idx, test_idx):
         print(f"LightGBM (tabular-only) Spearman: {rho:.4f}")
         importances = sorted(zip(lgbm.feature_importances_, range(train_tab.shape[1])), reverse=True)[:8]
         print(f"Top feature indices by importance: {[idx for _, idx in importances]}")
-        print("Compare this to LightGBM WITH embeddings (0.4457) above:")
-        print("  - if tabular-only is close to 0.4457 -> embeddings add ~nothing via this baseline")
-        print("  - if tabular-only is much lower -> embeddings ARE carrying real signal, "
-              "and the late-fusion net is failing to extract it, not the embeddings' fault\n")
+        if lgbm_with_embed_rho is not None:
+            print(f"Compare this to LightGBM WITH full embeddings ({lgbm_with_embed_rho:.4f}) above:")
+            print(f"  - if tabular-only ({rho:.4f}) is close -> embeddings add ~nothing, even unpooled")
+            print(f"  - if tabular-only is much lower -> embeddings ARE carrying real signal, "
+                  "and the late-fusion net is failing to extract it, not the embeddings' fault\n")
+        else:
+            print()
     else:
         print("LightGBM not installed -- skipping\n")
 
 
 def run_baseline(df, train_idx, val_idx, test_idx, image_embeddings, text_embeddings):
-    print("=== Baseline: tabular + mean-pooled embeddings ===")
+    print("=== Baseline: tabular + FULL embeddings (all dims, not pooled) ===")
+    # NOTE: a previous version of this baseline pooled each embedding down to
+    # a single scalar via `.mean(axis=1)`, which destroys nearly all the
+    # structure in the embedding space before the baseline ever sees it.
+    # That made "tabular-only ~= tabular+embeddings" an artifact of the crude
+    # pooling, not evidence that the embeddings lack signal. Ridge and
+    # LightGBM can both consume the full-dimensional embeddings directly, so
+    # we pass them through unpooled -- this is the fair version of the test.
     genre_categories = sorted(df.iloc[train_idx]["genre"].dropna().unique().tolist())
     train_tab, scaler = build_tabular_matrix(df.iloc[train_idx], genre_categories, fit_scaler=True)
     test_tab, _ = build_tabular_matrix(df.iloc[test_idx], genre_categories, scaler=scaler)
 
-    def pooled(idx):
-        img = image_embeddings[idx].mean(axis=1, keepdims=True)  # crude pool -> 1 col
-        txt = text_embeddings[idx].mean(axis=1, keepdims=True)
-        return np.hstack([img, txt])
+    def full_embed(idx):
+        return np.hstack([image_embeddings[idx], text_embeddings[idx]])
 
-    X_train = np.hstack([train_tab, pooled(train_idx)])
-    X_test = np.hstack([test_tab, pooled(test_idx)])
+    X_train = np.hstack([train_tab, full_embed(train_idx)])
+    X_test = np.hstack([test_tab, full_embed(test_idx)])
     y_train = df.iloc[train_idx]["target"].values
     y_test = df.iloc[test_idx]["target"].values
 
     xs = StandardScaler().fit(X_train)
     X_train_s, X_test_s = xs.transform(X_train), xs.transform(X_test)
 
-    ridge = Ridge(alpha=1.0).fit(X_train_s, y_train)
+    # Ridge with ~800+ correlated embedding dims and a few thousand rows is
+    # prone to overfitting even with alpha=1.0 -- included mainly as a linear
+    # reference point, LightGBM is the more trustworthy baseline here.
+    ridge = Ridge(alpha=10.0).fit(X_train_s, y_train)
     ridge_pred = ridge.predict(X_test_s)
     ridge_rho, _ = spearmanr(ridge_pred, y_test)
     print(f"Ridge         Spearman: {ridge_rho:.4f}")
 
+    lgbm_rho = None
     if HAS_LGBM:
         lgbm = LGBMRegressor(n_estimators=300, learning_rate=0.03, verbose=-1)
         lgbm.fit(X_train, y_train)
@@ -149,8 +161,11 @@ def run_baseline(df, train_idx, val_idx, test_idx, image_embeddings, text_embedd
     else:
         print("LightGBM not installed -- skipping (pip install lightgbm to include it)")
 
-    print("Compare both against the late-fusion model's test Spearman (0.1940).")
-    print("If either baseline matches or beats it, the extra architecture isn't buying you signal.\n")
+    print("Compare both against the late-fusion model's test Spearman (see below).")
+    print("If either baseline matches or beats it, the net isn't extracting the signal")
+    print("that's actually available in the embeddings -- an optimization/training")
+    print("problem in the net, not evidence the embeddings themselves are uninformative.\n")
+    return lgbm_rho
 
 
 def load_trained_model_test_predictions(df, test_idx, image_embeddings, text_embeddings):
@@ -170,11 +185,12 @@ def load_trained_model_test_predictions(df, test_idx, image_embeddings, text_emb
         test_sub["target"].values, test_sub["video_id"].values,
     )
     test_loader = DataLoader(test_ds, batch_size=512)
-    _, preds, _ = evaluate(model, test_loader, torch.nn.HuberLoss(), device)
+    _, preds, targets = evaluate(model, test_loader, torch.nn.HuberLoss(), device)
+    test_spearman, _ = spearmanr(preds, targets)
 
     predicted_views = invert_target(preds, test_sub["trailing_avg_views"].values)
     actual_views = test_sub["views"].values
-    return predicted_views, actual_views
+    return predicted_views, actual_views, test_spearman
 
 
 def main():
@@ -184,12 +200,13 @@ def main():
     inspect_target_distribution(df)
     inspect_split_shift(df, train_idx, val_idx, test_idx)
     inspect_view_scale_shift(df, train_idx, val_idx, test_idx)
-    run_baseline(df, train_idx, val_idx, test_idx, image_embeddings, text_embeddings)
-    run_tabular_only_baseline(df, train_idx, test_idx)
+    lgbm_with_embed_rho = run_baseline(df, train_idx, val_idx, test_idx, image_embeddings, text_embeddings)
+    run_tabular_only_baseline(df, train_idx, test_idx, lgbm_with_embed_rho)
 
-    predicted_views, actual_views = load_trained_model_test_predictions(
+    predicted_views, actual_views, test_spearman = load_trained_model_test_predictions(
         df, test_idx, image_embeddings, text_embeddings
     )
+    print(f"Late-fusion net test Spearman: {test_spearman:.4f}\n")
     inspect_top_test_errors(df, test_idx, predicted_views, actual_views)
 
 

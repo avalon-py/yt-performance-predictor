@@ -17,6 +17,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from scipy.stats import spearmanr
+from collections import deque
+
 
 from features.target import compute_target, invert_target
 from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS, TABULAR_NUMERIC_COLS, TABULAR_BOOL_COLS
@@ -28,13 +30,15 @@ EMBEDDINGS_DIR = "data/embeddings"
 CHECKPOINT_PATH = "models/checkpoints/late_fusion_v1.pt"
 
 BATCH_SIZE = 64
-EPOCHS = 100
-LEARNING_RATE = 2.5e-5
+EPOCHS = 200
+LEARNING_RATE = 3e-5
 VAL_FRACTION = 0.15
 TEST_FRACTION = 0.15
-EARLY_STOP_PATIENCE = 10
-WEIGHT_DECAY = 5e-3
-
+EARLY_STOP_PATIENCE = 20
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.3
+EMBEDDING_NOISE_STD = 0.05
+SPEARMAN_SMOOTHING_WINDOW = 5
 
 def load_data():
     df = pd.read_csv(CSV_PATH)
@@ -126,6 +130,21 @@ def evaluate(model, loader, loss_fn, device):
     return total_loss / len(loader.dataset), np.array(all_preds), np.array(all_targets)
 
 
+def constant_mean_reference(train_targets, val_targets, loss_fn):
+    """Huber loss and Spearman of the 'predict the training mean for
+    everything' baseline. If the trained model barely beats this on val
+    loss, and/or its val Spearman is near zero, it's not learning much of a
+    real relationship -- that's underfitting, not a data/architecture
+    problem, and no amount of extra capacity or more data fixes it; the fix
+    is loosening the optimization (higher LR, less regularization)."""
+    const_pred = np.full_like(val_targets, fill_value=train_targets.mean(), dtype=np.float64)
+    loss = loss_fn(torch.tensor(const_pred), torch.tensor(val_targets)).item()
+    # Spearman is undefined (NaN) for a constant vector by construction --
+    # printed as N/A rather than 0.0 to avoid implying it's "no correlation"
+    # measured, versus "not a meaningful comparison at all".
+    return loss
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df, image_embeddings, text_embeddings = load_data()
@@ -158,22 +177,43 @@ def main():
         image_dim=image_embeddings.shape[1],
         text_dim=text_embeddings.shape[1],
         tabular_dim=train_tabular.shape[1],
+        dropout=DROPOUT,
+        embedding_noise_std=EMBEDDING_NOISE_STD,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     loss_fn = torch.nn.HuberLoss()
 
-    best_val_loss = float("inf")
+    const_val_loss = constant_mean_reference(
+        df.iloc[train_idx]["target"].values, df.iloc[val_idx]["target"].values, loss_fn
+    )
+    print(f"Reference: constant (train-mean) val_loss={const_val_loss:.4f}, val_spearman=N/A (constant vector)\n")
+
+    best_smoothed_spearman = -float("inf")
     epochs_without_improvement = 0
+    spearman_window = deque(maxlen=SPEARMAN_SMOOTHING_WINDOW)
     os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
     for epoch in range(1, EPOCHS + 1):
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
-        val_loss, _, _ = evaluate(model, val_loader, loss_fn, device)
-        print(f"Epoch {epoch:3d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+        val_loss, val_preds, val_targets = evaluate(model, val_loader, loss_fn, device)
+        val_spearman, _ = spearmanr(val_preds, val_targets)
+        spearman_window.append(val_spearman)
+        smoothed_spearman = (
+            sum(spearman_window) / len(spearman_window)
+            if len(spearman_window) == SPEARMAN_SMOOTHING_WINDOW
+            else None
+        )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        smoothed_str = f"{smoothed_spearman:.4f}" if smoothed_spearman is not None else "N/A"
+        print(f"Epoch {epoch:3d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+              f"val_spearman={val_spearman:.4f} | smoothed={smoothed_str}")
+
+        if smoothed_spearman is None:
+            continue  # not enough epochs yet to evaluate the smoothed criterion
+
+        if smoothed_spearman > best_smoothed_spearman:
+            best_smoothed_spearman = smoothed_spearman
             epochs_without_improvement = 0
             torch.save({
                 "model_state_dict": model.state_dict(),
@@ -182,11 +222,14 @@ def main():
                 "image_dim": image_embeddings.shape[1],
                 "text_dim": text_embeddings.shape[1],
                 "tabular_dim": train_tabular.shape[1],
+                "epoch": epoch,
+                "val_spearman_raw": val_spearman,
+                "val_spearman_smoothed": smoothed_spearman,
             }, CHECKPOINT_PATH)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= EARLY_STOP_PATIENCE:
-                print(f"No val_loss improvement in {EARLY_STOP_PATIENCE} epochs -- stopping early.")
+                print(f"No smoothed val_spearman improvement in {EARLY_STOP_PATIENCE} epochs -- stopping early.")
                 break
 
     # Final test evaluation using the best checkpoint, not just the last epoch
@@ -200,12 +243,16 @@ def main():
     predicted_views = invert_target(preds, test_sub["trailing_avg_views"].values)
     actual_views = test_sub["views"].values
     rmse_views = np.sqrt(np.mean((predicted_views - actual_views) ** 2))
+    print(f"Checkpoint was saved at epoch {checkpoint.get('epoch', '?')} "
+          f"(smoothed val_spearman={checkpoint.get('val_spearman_smoothed', float('nan')):.4f}, "
+          f"raw val_spearman={checkpoint.get('val_spearman_raw', float('nan')):.4f})")
 
     print(f"\n--- Test results ---")
     print(f"Test loss (Huber, on target scale): {test_loss:.4f}")
     print(f"Spearman correlation (predicted vs actual relative performance): {spearman_corr:.4f}")
     print(f"RMSE in original view-count space: {rmse_views:,.0f}")
-
+    print(f"(Reference: constant train-mean predictor val_loss was {const_val_loss:.4f} -- "
+          f"if best val_loss during training was close to that, revisit LR/regularization.)")
 
 if __name__ == "__main__":
     main()
