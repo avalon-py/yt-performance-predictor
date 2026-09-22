@@ -28,11 +28,12 @@ EMBEDDINGS_DIR = "data/embeddings"
 CHECKPOINT_PATH = "models/checkpoints/late_fusion_v1.pt"
 
 BATCH_SIZE = 64
-EPOCHS = 30
-LEARNING_RATE = 1e-3
+EPOCHS = 100
+LEARNING_RATE = 2.5e-5
 VAL_FRACTION = 0.15
 TEST_FRACTION = 0.15
-EARLY_STOP_PATIENCE = 5  # stop if val_loss hasn't improved in this many epochs
+EARLY_STOP_PATIENCE = 10
+WEIGHT_DECAY = 5e-3
 
 
 def load_data():
@@ -45,7 +46,7 @@ def load_data():
             "`python -m models.precompute_visual_features` first."
         )
     visual = pd.read_csv(VISUAL_FEATURES_PATH)
-    df = df.merge(visual, on="video_id", how="left")  # left join -- rows not yet processed become NaN, filtered below
+    df = df.merge(visual, on="video_id", how="left")
 
     image_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "image_embeddings.npy"))
     text_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "text_embeddings.npy"))
@@ -55,8 +56,6 @@ def load_data():
     df = df.merge(video_id_order.reset_index().rename(columns={"index": "_embed_idx"}), on="video_id")
     df = df.sort_values("_embed_idx").reset_index(drop=True)
 
-    # Only rows that are: finalized, have a valid image embedding, have a real
-    # trailing-views value, and have visual features already computed
     mask = (
         df["label_finalized"]
         & valid_image_mask[df["_embed_idx"].values]
@@ -82,16 +81,15 @@ def load_data():
 
 
 def time_based_split(df):
-    df = df.sort_values("published_at").reset_index(drop=True)
-    n = len(df)
+    sorted_idx = df.sort_values("published_at").index
+    n = len(sorted_idx)
     train_end = int(n * (1 - VAL_FRACTION - TEST_FRACTION))
     val_end = int(n * (1 - TEST_FRACTION))
     return (
-        df.iloc[:train_end].index.values,
-        df.iloc[train_end:val_end].index.values,
-        df.iloc[val_end:].index.values,
+        sorted_idx[:train_end].to_numpy(),
+        sorted_idx[train_end:val_end].to_numpy(),
+        sorted_idx[val_end:].to_numpy(),
     )
-
 
 def train_epoch(model, loader, optimizer, loss_fn, device):
     model.train()
@@ -162,8 +160,8 @@ def main():
         tabular_dim=train_tabular.shape[1],
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    loss_fn = torch.nn.HuberLoss()  # more robust to view-count outliers than MSE
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    loss_fn = torch.nn.HuberLoss()
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
