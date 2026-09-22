@@ -8,10 +8,12 @@ Usage:
 
 import os
 import csv
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()  # must run before importing ingestion.youtube_client, which reads the API key at import time
+load_dotenv()
 
 import pandas as pd
 
@@ -21,22 +23,24 @@ from ingestion.tubecensus_client import get_subscriber_count_at
 from features.title_features import parse_duration_iso8601_to_seconds, title_features
 from features.trailing_views import compute_trailing_views
 
-CHANNELS = [
-    "@twosetviolin",
-    "@Jynxzi",
-    "@IShowSpeed",
-    "@KaiCenat",
-]
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "channels.json")
 PUBLISHED_AFTER = "2025-01-01T00:00:00Z"
 LABEL_MATURITY_DAYS = 28
-SHORTS_MAX_DURATION_SECONDS = 180  # skip anything at or under this length
+SHORTS_MAX_DURATION_SECONDS = 180
 OUTPUT_DIR = "data"
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
 CSV_PATH = os.path.join(OUTPUT_DIR, "videos.csv")
 
 
-def process_channel(channel_ref, rows, skipped_shorts, finalized_ids):
+def load_channels(config_path=CONFIG_PATH):
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def process_channel(channel_ref, rows, skipped_shorts):
     print(f"Processing {channel_ref}...")
     info = get_channel_info(channel_ref)
     if info is None:
@@ -98,58 +102,29 @@ def process_channel(channel_ref, rows, skipped_shorts, finalized_ids):
 
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
-
-    finalized_ids = set()
-    if os.path.exists(CSV_PATH):
-        existing = pd.read_csv(CSV_PATH)
-        existing["label_finalized"] = existing["label_finalized"].astype(str) == "True"
-        finalized_ids = set(existing.loc[existing["label_finalized"], "video_id"])
-        print(f"Loaded {len(finalized_ids)} already-finalized video IDs to skip re-fetching\n")
-
+    channels = load_channels()
+    
     rows = []
-    skipped_shorts = [0]  # mutable counter shared across process_channel calls
-    for channel_ref in CHANNELS:
+    skipped_shorts = [0]
+    for channel_ref in channels:
         try:
             process_channel(channel_ref, rows, skipped_shorts, finalized_ids)
         except Exception as e:
             print(f"  [error] {channel_ref}: {e}")
 
-    if not rows and not os.path.exists(CSV_PATH):
-        raise RuntimeError(
-            "No rows collected and no existing CSV to fall back on -- every channel "
-            "failed to resolve or returned zero qualifying videos. Check your CHANNELS "
-            "list and API key before debugging further."
-        )
-
-    new_df = pd.DataFrame(rows)  # may legitimately be empty if everything was already finalized
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = compute_trailing_views(df)
 
     if os.path.exists(CSV_PATH):
-        old_df = existing  # already loaded above, before the fetch loop
+        existing = pd.read_csv(CSV_PATH)
+        existing = existing[~existing["video_id"].isin(df["video_id"])]
+        df = pd.concat([existing, df], ignore_index=True)
 
-        # new_df can't contain finalized IDs anyway (we skipped fetching them),
-        # but guard here too in case CHANNELS/logic changes later
-        if not new_df.empty:
-            new_df = new_df[~new_df["video_id"].isin(finalized_ids)]
-
-        # Drop the stale (unfinalized) old version of anything we just re-fetched
-        refetched_ids = set(new_df["video_id"]) if not new_df.empty else set()
-        old_df = old_df[~((~old_df["label_finalized"]) & old_df["video_id"].isin(refetched_ids))]
-
-        combined = pd.concat([old_df, new_df], ignore_index=True)
-        print(f"\nMerged with existing CSV: {len(old_df)} kept unchanged (incl. finalized), "
-              f"{len(new_df)} new/refreshed rows")
-    else:
-        combined = new_df
-
-    # Recompute over the FULL merged set -- trailing views needs complete per-channel
-    # history, not just this run's rows, or newly added early videos would wrongly
-    # look like "first videos" to already-present later ones.
-    combined = compute_trailing_views(combined)
-    combined.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_MINIMAL)
-    print(f"Done. {len(combined)} total rows in {CSV_PATH}")
-    print(f"Skipped {skipped_shorts[0]} Shorts (<= {SHORTS_MAX_DURATION_SECONDS}s) this run")
+    df.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_MINIMAL)
+    print(f"\nDone. {len(df)} rows written to {CSV_PATH}")
+    print(f"Skipped {skipped_shorts[0]} Shorts (<= {SHORTS_MAX_DURATION_SECONDS}s)")
     print(f"Images saved to {IMAGES_DIR}/")
-
 
 if __name__ == "__main__":
     main()
