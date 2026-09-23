@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 data/
 .cache/
+models/plots/
+models/checkpoints/
