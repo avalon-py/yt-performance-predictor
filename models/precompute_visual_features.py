@@ -63,7 +63,7 @@ def main():
     todo = df[~df["video_id"].isin(already_done)]
     print(f"Processing {len(todo)} new thumbnails...")
 
-    CHECKPOINT_EVERY = 200  # write to disk periodically -- don't lose progress if interrupted
+    CHECKPOINT_EVERY = 200
 
     def flush(rows):
         if not rows:

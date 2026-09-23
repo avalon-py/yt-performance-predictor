@@ -40,7 +40,7 @@ def load_channels(config_path=CONFIG_PATH):
         return json.load(f)
 
 
-def process_channel(channel_ref, rows, skipped_shorts):
+def process_channel(channel_ref, rows, skipped_shorts, finalized_ids):
     print(f"Processing {channel_ref}...")
     info = get_channel_info(channel_ref)
     if info is None:
@@ -103,7 +103,13 @@ def process_channel(channel_ref, rows, skipped_shorts):
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     channels = load_channels()
-    
+
+    if os.path.exists(CSV_PATH):
+        existing_df = pd.read_csv(CSV_PATH)
+        finalized_ids = set(existing_df.loc[existing_df["label_finalized"] == True, "video_id"])
+    else:
+        finalized_ids = set()
+
     rows = []
     skipped_shorts = [0]
     for channel_ref in channels:
