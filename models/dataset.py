@@ -26,15 +26,20 @@ def build_tabular_matrix(df, genre_categories, scaler=None, fit_scaler=False):
     """Assemble the full tabular feature matrix. Fit the scaler only on train data,
     then reuse it (via fit_scaler=False) for val/test to avoid leaking their
     distribution into the scaling."""
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, RobustScaler
 
     log_cols = df[TABULAR_LOG_COLS].astype(float).apply(np.log1p).values
     numeric_cols = df[TABULAR_NUMERIC_COLS].astype(float).values
-    numeric_all = np.concatenate([log_cols, numeric_cols], axis=1)
 
     if fit_scaler:
-        scaler = StandardScaler().fit(numeric_all)
-    numeric_scaled = scaler.transform(numeric_all)
+        log_scaler = StandardScaler().fit(log_cols)
+        numeric_scaler = RobustScaler().fit(numeric_cols)
+        scaler = (log_scaler, numeric_scaler)
+    log_scaler, numeric_scaler = scaler
+
+    log_scaled = log_scaler.transform(log_cols)
+    numeric_scaled = numeric_scaler.transform(numeric_cols)
+    numeric_all_scaled = np.concatenate([log_scaled, numeric_scaled], axis=1)
 
     bool_cols = df[TABULAR_BOOL_COLS].astype(float).values
 
@@ -43,9 +48,8 @@ def build_tabular_matrix(df, genre_categories, scaler=None, fit_scaler=False):
         if genre in genre_categories:
             genre_onehot[i, genre_categories.index(genre)] = 1.0
 
-    tabular = np.concatenate([numeric_scaled, bool_cols, genre_onehot], axis=1).astype(np.float32)
+    tabular = np.concatenate([numeric_all_scaled, bool_cols, genre_onehot], axis=1).astype(np.float32)
     return tabular, scaler
-
 
 class VideoDataset(Dataset):
     def __init__(self, image_embeddings, text_embeddings, tabular, targets, video_ids):

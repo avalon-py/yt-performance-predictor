@@ -74,12 +74,12 @@ def load_data():
     image_embeddings = image_embeddings[idxs]
     text_embeddings = text_embeddings[idxs]
 
-    # Safe to convert now -- every remaining row already passed the notna()
-    # check above, so no NaN-to-string ambiguity to worry about here
     df["has_face"] = df["has_face"].astype(str) == "True"
     df["has_text_overlay"] = df["has_text_overlay"].astype(str) == "True"
 
     df["target"] = compute_target(df["views"], df["trailing_avg_views"])
+
+    df.to_csv("data/full_dataset.csv")
 
     return df, image_embeddings, text_embeddings
 

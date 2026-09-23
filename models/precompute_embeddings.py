@@ -52,7 +52,7 @@ def embed_images(df, image_encoder, batch_size=32):
             return
         with torch.no_grad():
             batch_tensor = torch.stack(batch_imgs)
-            out = image_encoder(batch_tensor).numpy()  # DINOv2 returns (batch, 384) directly
+            out = image_encoder(batch_tensor).numpy()
         for i, idx in enumerate(batch_idxs):
             embeddings[idx] = out[i]
             valid_mask[idx] = True
@@ -61,7 +61,7 @@ def embed_images(df, image_encoder, batch_size=32):
 
     for i, path in enumerate(df["thumbnail_path"]):
         if not isinstance(path, str) or not os.path.exists(path):
-            continue  # missing/failed thumbnail download -- row excluded downstream
+            continue
         try:
             img = Image.open(path).convert("RGB")
             batch_imgs.append(IMAGE_TRANSFORM(img))
