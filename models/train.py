@@ -17,24 +17,31 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from scipy.stats import spearmanr
+from collections import deque
+import matplotlib.pyplot as plt
+
 
 from features.target import compute_target, invert_target
 from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS, TABULAR_NUMERIC_COLS, TABULAR_BOOL_COLS
 from models.late_fusion_model import LateFusionModel
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
 CSV_PATH = "data/videos.csv"
 VISUAL_FEATURES_PATH = "data/visual_features.csv"
 EMBEDDINGS_DIR = "data/embeddings"
 CHECKPOINT_PATH = "models/checkpoints/late_fusion_v1.pt"
+PLOTS_DIR = "models/plots"
 
 BATCH_SIZE = 64
-EPOCHS = 100
-LEARNING_RATE = 2.5e-5
-VAL_FRACTION = 0.15
+EPOCHS = 200
+LEARNING_RATE = 2e-5
+VAL_FRACTION = 0.2
 TEST_FRACTION = 0.15
 EARLY_STOP_PATIENCE = 10
-WEIGHT_DECAY = 5e-3
-
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.2
+EMBEDDING_NOISE_STD = 0.02
+SPEARMAN_SMOOTHING_WINDOW = 5  # still used for the plotted/reported smoothed Spearman, not for stopping
 
 def load_data():
     df = pd.read_csv(CSV_PATH)
@@ -70,12 +77,12 @@ def load_data():
     image_embeddings = image_embeddings[idxs]
     text_embeddings = text_embeddings[idxs]
 
-    # Safe to convert now -- every remaining row already passed the notna()
-    # check above, so no NaN-to-string ambiguity to worry about here
     df["has_face"] = df["has_face"].astype(str) == "True"
     df["has_text_overlay"] = df["has_text_overlay"].astype(str) == "True"
 
     df["target"] = compute_target(df["views"], df["trailing_avg_views"])
+
+    df.to_csv("data/full_dataset.csv")
 
     return df, image_embeddings, text_embeddings
 
@@ -126,6 +133,60 @@ def evaluate(model, loader, loss_fn, device):
     return total_loss / len(loader.dataset), np.array(all_preds), np.array(all_targets)
 
 
+def constant_mean_reference(train_targets, val_targets, loss_fn):
+    """Huber loss of the 'predict the training mean for everything' baseline.
+    If the trained model barely beats this on val loss, it's not learning
+    much of a real relationship -- that's underfitting, not a data/architecture
+    problem, and no amount of extra capacity or more data fixes it; the fix
+    is loosening the optimization (higher LR, less regularization)."""
+    const_pred = np.full_like(val_targets, fill_value=train_targets.mean(), dtype=np.float64)
+    loss = loss_fn(torch.tensor(const_pred), torch.tensor(val_targets)).item()
+    return loss
+
+
+def plot_training_curves(train_losses, val_losses, val_spearmans, smoothed_spearmans,
+                          best_epoch, plots_dir):
+    os.makedirs(plots_dir, exist_ok=True)
+    epochs_range = range(1, len(train_losses) + 1)
+
+    # --- Loss curve (overfitting indicator + actual stopping criterion) ---
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs_range, train_losses, label="train_loss")
+    ax.plot(epochs_range, val_losses, label="val_loss")
+    if best_epoch is not None:
+        ax.axvline(best_epoch, color="gray", linestyle="--", alpha=0.6,
+                   label=f"checkpoint (epoch {best_epoch})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Huber loss")
+    ax.set_title("Train vs Val Loss")
+    ax.legend()
+    fig.tight_layout()
+    loss_path = os.path.join(plots_dir, "loss_curve.png")
+    fig.savefig(loss_path, dpi=150)
+    plt.close(fig)
+
+    # --- Spearman curve (reported for interpretation, not used for stopping) ---
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs_range, val_spearmans, label="val_spearman (raw)", alpha=0.4)
+    smoothed_x = [e for e, s in zip(epochs_range, smoothed_spearmans) if s is not None]
+    smoothed_y = [s for s in smoothed_spearmans if s is not None]
+    if smoothed_y:
+        ax.plot(smoothed_x, smoothed_y, label="val_spearman (smoothed)", linewidth=2)
+    if best_epoch is not None:
+        ax.axvline(best_epoch, color="gray", linestyle="--", alpha=0.6,
+                   label=f"checkpoint (epoch {best_epoch})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Spearman correlation")
+    ax.set_title("Validation Spearman Correlation (diagnostic only -- not the stopping criterion)")
+    ax.legend()
+    fig.tight_layout()
+    spearman_path = os.path.join(plots_dir, "spearman_curve.png")
+    fig.savefig(spearman_path, dpi=150)
+    plt.close(fig)
+
+    print(f"\nSaved training curves to {loss_path} and {spearman_path}")
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df, image_embeddings, text_embeddings = load_data()
@@ -158,22 +219,57 @@ def main():
         image_dim=image_embeddings.shape[1],
         text_dim=text_embeddings.shape[1],
         tabular_dim=train_tabular.shape[1],
+        dropout=DROPOUT,
+        embedding_noise_std=EMBEDDING_NOISE_STD,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     loss_fn = torch.nn.HuberLoss()
 
+    const_val_loss = constant_mean_reference(
+        df.iloc[train_idx]["target"].values, df.iloc[val_idx]["target"].values, loss_fn
+    )
+    print(f"Reference: constant (train-mean) val_loss={const_val_loss:.4f}\n")
+
     best_val_loss = float("inf")
+    best_epoch = None
     epochs_without_improvement = 0
+    spearman_window = deque(maxlen=SPEARMAN_SMOOTHING_WINDOW)
     os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
+
+    train_loss_history = []
+    val_loss_history = []
+    val_spearman_history = []
+    smoothed_spearman_history = []
 
     for epoch in range(1, EPOCHS + 1):
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
-        val_loss, _, _ = evaluate(model, val_loader, loss_fn, device)
-        print(f"Epoch {epoch:3d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+        val_loss, val_preds, val_targets = evaluate(model, val_loader, loss_fn, device)
+        val_spearman, _ = spearmanr(val_preds, val_targets)
+        spearman_window.append(val_spearman)
+        smoothed_spearman = (
+            sum(spearman_window) / len(spearman_window)
+            if len(spearman_window) == SPEARMAN_SMOOTHING_WINDOW
+            else None
+        )
 
+        train_loss_history.append(train_loss)
+        val_loss_history.append(val_loss)
+        val_spearman_history.append(val_spearman)
+        smoothed_spearman_history.append(smoothed_spearman)
+
+        smoothed_str = f"{smoothed_spearman:.4f}" if smoothed_spearman is not None else "N/A"
+        print(f"Epoch {epoch:3d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+              f"val_spearman={val_spearman:.4f} | smoothed={smoothed_str}")
+
+        # Pure val_loss-based checkpointing and early stopping: same quantity
+        # the optimizer is minimizing, stable/low-variance in our curves,
+        # and on the normalized log-ratio scale rather than raw view-count
+        # space -- so a single viral outlier can't dominate the decision the
+        # way it would if RMSE-in-views were used instead.
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch
             epochs_without_improvement = 0
             torch.save({
                 "model_state_dict": model.state_dict(),
@@ -182,12 +278,22 @@ def main():
                 "image_dim": image_embeddings.shape[1],
                 "text_dim": text_embeddings.shape[1],
                 "tabular_dim": train_tabular.shape[1],
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "val_spearman_raw": val_spearman,
+                "val_spearman_smoothed": smoothed_spearman,
             }, CHECKPOINT_PATH)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= EARLY_STOP_PATIENCE:
                 print(f"No val_loss improvement in {EARLY_STOP_PATIENCE} epochs -- stopping early.")
                 break
+
+    plot_training_curves(
+        train_loss_history, val_loss_history,
+        val_spearman_history, smoothed_spearman_history,
+        best_epoch, PLOTS_DIR,
+    )
 
     # Final test evaluation using the best checkpoint, not just the last epoch
     checkpoint = torch.load(CHECKPOINT_PATH, weights_only=False)
@@ -200,12 +306,30 @@ def main():
     predicted_views = invert_target(preds, test_sub["trailing_avg_views"].values)
     actual_views = test_sub["views"].values
     rmse_views = np.sqrt(np.mean((predicted_views - actual_views) ** 2))
+    mae_target_scale = mean_absolute_error(targets, preds)
+    mae_views = mean_absolute_error(actual_views, predicted_views)
+    mape_views = mean_absolute_percentage_error(actual_views, predicted_views)
+    binary_labels = (targets > 0).astype(int)
+    if len(np.unique(binary_labels)) < 2:
+        auc = float("nan")
+        print("  [warn] test set has only one class (all over- or all under-performing) -- AUC undefined")
+    else:
+        auc = roc_auc_score(binary_labels, preds)
 
-    print(f"\n--- Test results ---")
+    print(f"Checkpoint was saved at epoch {checkpoint.get('epoch', '?')} "
+          f"(val_loss={checkpoint.get('val_loss', float('nan')):.4f}, "
+          f"val_spearman_raw={checkpoint.get('val_spearman_raw', float('nan')):.4f})")
+
+    print(f"\n--- Test results (all downstream/diagnostic -- not used to select the checkpoint) ---")
     print(f"Test loss (Huber, on target scale): {test_loss:.4f}")
     print(f"Spearman correlation (predicted vs actual relative performance): {spearman_corr:.4f}")
     print(f"RMSE in original view-count space: {rmse_views:,.0f}")
-
+    print(f"MAE (target scale): {mae_target_scale:.4f}")
+    print(f"MAE (view-count scale): {mae_views:,.0f}")
+    print(f"MAPE (view-count scale): {mape_views:.2%}")
+    print(f"AUC (overperform vs underperform baseline): {auc:.4f}")
+    print(f"(Reference: constant train-mean predictor val_loss was {const_val_loss:.4f} -- "
+          f"if best val_loss during training was close to that, revisit LR/regularization.)")
 
 if __name__ == "__main__":
     main()

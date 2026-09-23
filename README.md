@@ -123,8 +123,15 @@ python models/late_fusion_model.py
 # 3. Precompute frozen embeddings (one-time, or after adding new data)
 python -m models.precompute_embeddings
 
-# 4. Train
+# 4. Precompute visual-related features (has_face, overlays, etc.)
+python -m models.precompute_visual_features
+
+# 5. Train
 python -m models.train
+
+# 6. Ablation tests
+python -m models.ablation_tabular_only
+python -m models.inspect_target_and_baseline
 ```
 
 ## Status
