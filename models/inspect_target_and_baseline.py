@@ -4,7 +4,7 @@ Diagnostics for the late-fusion regression run:
   2. Train/val/test distribution shift under the time-based split
   3. Model comparison table: Ridge and LightGBM (tabular + full embeddings),
      LightGBM (tabular-only), and the trained late-fusion net -- all scored
-     with Spearman on the identical test split, in one table.
+     on RMSE/MAE/MAPE/Spearman/AUC, on the identical test split, in one table.
   4. Top-error inspection (is RMSE outlier-dominated?)
 
 Usage:
@@ -17,6 +17,7 @@ import torch
 from scipy.stats import skew, spearmanr
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
 from models.train import load_data, time_based_split, CHECKPOINT_PATH, evaluate
 from models.dataset import build_tabular_matrix, VideoDataset
@@ -61,6 +62,31 @@ def inspect_view_scale_shift(df, train_idx, val_idx, test_idx):
         print(f"{name:5s}: views mean={v.mean():,.0f} median={np.median(v):,.0f} max={v.max():,.0f}  |  "
               f"trailing_avg mean={tav.mean():,.0f} median={np.median(tav):,.0f} max={tav.max():,.0f}")
     print("(If test's mean/max are far above train's, RMSE growth is a scale-shift artifact, not just model decay.)\n")
+
+
+def compute_metrics(preds, targets, trailing_avg_views, actual_views):
+    """Same metric set used in models/baseline.py, so every comparison in
+    this project reads the same way."""
+    predicted_views = invert_target(preds, trailing_avg_views)
+
+    rmse_views = np.sqrt(np.mean((predicted_views - actual_views) ** 2))
+    mae_views = mean_absolute_error(actual_views, predicted_views)
+    mape_views = mean_absolute_percentage_error(actual_views, predicted_views)
+
+    if np.std(preds) < 1e-12:
+        spearman_corr, auc = float("nan"), float("nan")
+    else:
+        spearman_corr, _ = spearmanr(preds, targets)
+        binary_labels = (targets > 0).astype(int)
+        auc = roc_auc_score(binary_labels, preds) if len(np.unique(binary_labels)) == 2 else float("nan")
+
+    return {
+        "RMSE (views)": rmse_views,
+        "MAE (views)": mae_views,
+        "MAPE (views)": mape_views,
+        "Spearman": spearman_corr,
+        "AUC": auc,
+    }
 
 
 def get_tabular_only_predictions(df, train_idx, test_idx):
@@ -131,31 +157,23 @@ def get_fusion_model_predictions(df, test_idx, image_embeddings, text_embeddings
     return preds, checkpoint
 
 
-def print_model_comparison_table(y_test, predictions):
+def print_model_comparison_table(y_test, trailing_avg_views, actual_views, predictions):
     """predictions: dict of {model_name: preds_array or None}. Builds one
-    Spearman-vs-Spearman table so every model's ranking skill is visible
+    RMSE/MAE/MAPE/Spearman/AUC table so every model's performance is visible
     side by side, instead of scattered across separate print blocks."""
     rows = {}
     for name, pred in predictions.items():
         if pred is None:
-            rows[name] = float("nan")
+            rows[name] = {k: float("nan") for k in ["RMSE (views)", "MAE (views)", "MAPE (views)", "Spearman", "AUC"]}
         else:
-            rho, _ = spearmanr(pred, y_test)
-            rows[name] = rho
+            rows[name] = compute_metrics(pred, y_test, trailing_avg_views, actual_views)
 
-    table = pd.Series(rows, name="Spearman").sort_values(ascending=False)
-    print("=== Model comparison: Spearman on identical test split (higher = better ranking) ===\n")
-    print(table.to_string(float_format=lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A (not installed)"))
+    table = pd.DataFrame(rows).T
+    table = table[["RMSE (views)", "MAE (views)", "MAPE (views)", "Spearman", "AUC"]]
+    table = table.sort_values("Spearman", ascending=False)
 
-    print("\nHow to read this:")
-    print("- Ranked highest to lowest -- the late-fusion net should beat every tabular-only")
-    print("  baseline if the image/text branches are earning their complexity.")
-    print("- If 'LightGBM (tabular + embeddings)' or 'Ridge (tabular + embeddings)' beats the")
-    print("  late-fusion net, the embeddings DO carry usable signal -- the net is failing to")
-    print("  extract it (an optimization/architecture problem), not evidence the embeddings")
-    print("  themselves are uninformative.")
-    print("- If 'LightGBM (tabular-only)' is close to 'LightGBM (tabular + embeddings)', the")
-    print("  embeddings add ~nothing even to a model that CAN use them well.\n")
+    print("=== Model comparison: all metrics, identical test split ===\n")
+    print(table.to_string(float_format=lambda x: f"{x:,.4f}" if not np.isnan(x) else "N/A"))
 
 
 def inspect_top_test_errors(df, test_idx, predicted_views, actual_views, top_n=10):
@@ -193,7 +211,10 @@ def inspect_top_test_errors(df, test_idx, predicted_views, actual_views, top_n=1
 def main():
     df, image_embeddings, text_embeddings = load_data()
     train_idx, val_idx, test_idx = time_based_split(df)
-    y_test = df.iloc[test_idx]["target"].values
+    test_sub = df.iloc[test_idx]
+    y_test = test_sub["target"].values
+    trailing_avg_views = test_sub["trailing_avg_views"].values
+    actual_views = test_sub["views"].values
 
     inspect_target_distribution(df)
     inspect_split_shift(df, train_idx, val_idx, test_idx)
@@ -205,7 +226,7 @@ def main():
     lgbm_tabular_pred, top_features = get_tabular_only_predictions(df, train_idx, test_idx)
     fusion_pred, checkpoint = get_fusion_model_predictions(df, test_idx, image_embeddings, text_embeddings)
 
-    print_model_comparison_table(y_test, {
+    print_model_comparison_table(y_test, trailing_avg_views, actual_views, {
         "Late-fusion net": fusion_pred,
         "LightGBM (tabular + embeddings)": lgbm_embed_pred,
         "Ridge (tabular + embeddings)": ridge_pred,
@@ -218,9 +239,7 @@ def main():
     print(f"Fusion model checkpoint: epoch {checkpoint.get('epoch', '?')}, "
           f"val_loss={checkpoint.get('val_loss', float('nan')):.4f}\n")
 
-    test_sub = df.iloc[test_idx]
-    predicted_views = invert_target(fusion_pred, test_sub["trailing_avg_views"].values)
-    actual_views = test_sub["views"].values
+    predicted_views = invert_target(fusion_pred, trailing_avg_views)
     inspect_top_test_errors(df, test_idx, predicted_views, actual_views)
 
 
