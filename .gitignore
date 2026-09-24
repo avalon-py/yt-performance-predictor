@@ -6,3 +6,4 @@ data/
 .cache/
 models/plots/
 models/checkpoints/
+notes/
