@@ -12,7 +12,6 @@ comm==0.2.3
 contourpy==1.4.0
 cycler==0.12.1
 debugpy==1.8.22
-easyocr==1.7.2
 executing==2.2.1
 facenet-pytorch==2.6.0
 filelock==4.0.1
