@@ -1,110 +1,222 @@
 # yt-performance-predictor
 
-Predicts how a YouTube video will perform (views, relative to the channel's own baseline) from its **thumbnail + title alone, before it's published** — with a continuous training pipeline that keeps the model current as new data arrives.
+Predicts how a YouTube video will perform (views, relative to the channel's own baseline) from its **thumbnail + title alone, before it's published**, and is being built out into a continuously retrained, deployed service.
 
-## Why this exists
+## Status
 
-Most "will this thumbnail work" tools are black boxes. This project builds one end-to-end: real data ingestion, honest handling of the messy parts (delayed labels, channel-size normalization, staleness), a multimodal deep learning model, and a plan to run it as a continuously retrained production system rather than a one-off notebook.
+| Area | State |
+|---|---|
+| Ingestion (YouTube API, thumbnails, title features) | Built, runs locally, writes `data/videos.csv` |
+| Embedding + visual-feature caches | Built (`models/precompute_*.py`) |
+| Late-fusion model + training + experiment log | Built; ~10.6k finalized rows, test Spearman ≈ 0.33 (see [Results](#results)) |
+| Baselines / diagnostics | Built (`models/baseline.py`, `models/inspect_target_and_baseline.py`, `models/ablation_modalities.py`) |
+| Model bundle export, serving code, Docker images | **Not built yet** |
+| Postgres, Airflow, retrain/promotion, drift monitoring | **Not built yet** (designed, see [Deployment plan](#deployment-plan-planned-not-yet-implemented)) |
+| Deployment (Oracle Cloud VM) | **Not started** |
+
+Everything under "Deployment plan" and "Roadmap" is a design, not running code.
 
 ## What it predicts
 
-Given a **thumbnail image + title** (known before publish), predict the video's **relative performance** — how it will do compared to that channel's own recent average, not raw view count. Raw views are dominated by channel size; normalizing against the channel's own baseline isolates the effect of the thumbnail/title itself.
+Given a **thumbnail image + title** (known before publish), predict the video's **relative performance**: how it will do compared to that channel's own recent average, not raw view count. Raw views are dominated by channel size; normalizing against the channel's own baseline isolates the effect of the thumbnail/title itself.
 
 ```
 target = log(1 + views) − log(1 + trailing_avg_views)
 ```
 
-Where `trailing_avg_views` is the channel's average views over its N most recent prior uploads — computed causally (only videos published *before* the one in question), so it's genuinely available at prediction time with no leakage.
+`trailing_avg_views` is the channel's mean views over its 5 most recent prior uploads (`features/trailing_views.py`, rolling window shifted by one so a video never sees itself). Predicted views are recovered with `invert_target`: `expm1(score + log1p(trailing_avg_views))`.
 
-## Pipeline overview
+## Pipeline today (local)
 
 ```
-YouTube Data API v3  ──►  ingestion/  ──►  data/videos.csv + data/images/
-                                              │
-                                              ▼
-                                    features/ (title stats, trailing views)
-                                              │
-                                              ▼
-                              models/precompute_embeddings.py
-                              (frozen DINOv2 + MiniLM, cached once)
-                                              │
-                                              ▼
-                                     models/train.py
-                              (late fusion head, time-based split)
+YouTube Data API v3 ──► pipeline/run_ingestion.py ──► data/videos.csv + data/images/
+                                                          │
+                          ┌───────────────────────────────┴───────────────┐
+                          ▼                                               ▼
+        models/precompute_embeddings.py                 models/precompute_visual_features.py
+        (frozen CLIP / DINOv2 / MiniLM,                 (faces, text overlay, color stats
+         cached to data/embeddings/<encoder>/)           → data/visual_features.csv)
+                          └───────────────────────────────┬───────────────┘
+                                                          ▼
+                                                  models/train.py
+                                   (late-fusion head, chronological split,
+                                    appends each run to experiments/results.jsonl)
 ```
 
 ## Data
 
-- **Source:** YouTube Data API v3 (`playlistItems.list` + `videos.list`, cheap endpoints — avoid `search.list`, which costs 100x more quota per call).
-- **Scope:** ~100 English-speaking channels, hand-curated to exclude channels where views are driven by external events rather than thumbnail/title choice (news channels, official music/artist channels tied to release calendars). Personality, gaming, commentary, and entertainment channels are the target profile.
-- **Window:** videos published from **2025-01-01 onward**.
-- **Shorts excluded:** anything ≤180s duration is filtered out before download/storage — Shorts are discovered completely differently (feed-driven) and don't share the same performance dynamics as long-form video.
-- **Storage:** local disk for now (`data/images/{video_id}.jpg`, `data/videos.csv`). Raw images are kept as source of truth rather than only storing embeddings, so encoders can be swapped or fine-tuned later without re-downloading.
+- **Source:** YouTube Data API v3 (`playlistItems.list` + `videos.list`; `search.list` is deliberately avoided, it costs ~100x more quota).
+- **Scope:** hand-curated English-speaking channels, excluding channels whose views are driven by external events (news, official music channels tied to release calendars). Personality, gaming, commentary and entertainment channels are the target profile. `pipeline/config/channels.json` is the list `run_ingestion` reads (currently 3 handles); `pipeline/config/cum_channels.json` holds a larger list of 143 handles.
+- **Window:** videos published from **2025-01-01** onward.
+- **Shorts excluded:** anything ≤180s is dropped before download or storage.
+- **Size:** the latest experiments train on 8,472 rows, validate on 1,059 and test on 1,060 (10,591 usable rows after filtering).
+- **Storage (local for now):** `data/images/{video_id}.jpg`, `data/videos.csv`, `data/visual_features.csv`, `data/embeddings/<image_encoder>/`. Raw images are kept as the source of truth so encoders can be swapped without re-downloading.
 
 ### Fields retrieved vs. derived
 
-| Retrieved (API) | Derived (computed locally) |
+| Retrieved (API) | Derived locally |
 |---|---|
-| Thumbnail image | Title length, word count |
-| Title (raw text) | Capitalized-word count, capitalized-letter count & ratio |
-| Views | Symbol count, has-question-mark, has-number |
-| Subscriber count | Trailing average views (rolling, shifted to prevent leakage) |
-| `categoryId` → genre | `is_first_video` flag (no prior videos in window) |
-| Duration, publish date | |
+| Thumbnail image | Title length, word count, capitalized-word/letter counts and ratio, symbol count, has-question-mark, has-number |
+| Title (raw text) | Trailing average views (rolling, shifted), `is_first_video` |
+| Views, duration, publish date | Face count / has-face, text-overlay flag (MTCNN, EasyOCR); *being removed, see Ablations* |
+| Subscriber count | Thumbnail color stats: mean saturation, brightness, brightness std, warm-hue ratio; *being removed, see Ablations* |
+| `categoryId` → genre | Optional `clip_sim`: cosine similarity between CLIP image and CLIP title embeddings |
 
-### Known limitations (tracked, not hidden)
+## Model: v1 late fusion
 
-- **`subscriber_count_at_upload` is actually current subscriber count**, not the true value at publish time. A TubeCensus integration (historical subscriber snapshots via Wayback Machine data) was attempted and shelved — real package, but required ~20GB local storage and hit Windows permission issues with diminishing returns for a v1. Revisit later if this proves to matter; a coarse tier bucket (e.g. `<100K / 100K-1M / 1M-5M / ...`) is a cheap partial fix if needed, since it's far less sensitive to staleness than an exact number.
-- **Delayed labeling:** a video's view count isn't "final" the moment it's published. Rows are only used for training once `label_finalized = True`, which flips after ~28 days. Views are refreshed on a decreasing cadence as a video ages (always for <2 months old, checked for >5% change for 2-6 months, never touched beyond 6 months) — but once `label_finalized` flips, that row's views are never rewritten again, ever, for reproducibility.
-- **`is_first_video`** means "first video *in our fetched 2025+ window*" for that channel, not literally the channel's first upload ever — there's no trailing-views signal available for these regardless of channel age, since earlier history wasn't pulled.
-- Ingestion re-runs are **idempotent and incremental**: thumbnails are skipped if already downloaded, and already-finalized `video_id`s are excluded from the `videos.list` fetch entirely (not just discarded after fetching), so quota cost scales with what's actually new, not total dataset size.
+Three branches, each with its own frozen pretrained encoder (where applicable), a small learned projection, then concatenation and an MLP regression head.
 
-## Model — v1: Late Fusion
+- **Image branch:** default **CLIP ViT-B/32** (512-d, thumbnails squashed to 224x224). Alternatives selectable at embedding time: DINOv2 ViT-S/14 (384-d), CLIP ViT-B/16.
+- **Text branch:** default **CLIP text tower** on the title (512-d), same space as the CLIP image embedding. Alternative: `all-MiniLM-L6-v2` (384-d).
+- **Tabular branch:** log-scaled subscriber count and trailing average views, duration, title stats, face count, color stats, boolean flags (question mark, number, has-face, text overlay), one-hot genre, and optionally `clip_sim`. (The face, text-overlay and color-stat features are being removed; see [Ablations](#ablations).)
+- **Fusion:** each branch → 32-d projection (ReLU + dropout) → concatenate → 64 → 16 → 1.
+- **Encoders are fully frozen.** Only projections and the head train. Embeddings are computed once and cached, since frozen encoders give identical outputs every epoch.
 
-Three independent branches, each with its own frozen pretrained encoder, projected and concatenated before a small regression head:
+**Training setup** (`models/train.py`): Huber loss, Adam (lr 2e-5, weight decay 1e-4), batch 64, dropout 0.2, Gaussian noise (std 0.02) on the embeddings during training, early stopping on validation loss (patience 10, max 200 epochs), best-val-loss checkpoint kept. Split is **chronological by `published_at`** at 80/10/10 by row fraction, so validation and test are always the newest videos. Scalers are fit on the training split only.
 
-- **Image branch:** DINOv2 ViT-S/14 (self-supervised, 384-dim) — chosen over a supervised ImageNet backbone (e.g. ConvNeXt) because supervised features are compressed around 1,000-category object discrimination, discarding compositional/aesthetic signal (color, contrast, framing) that plausibly matters more for thumbnail performance than "what object is this."
-- **Text branch:** `all-MiniLM-L6-v2` sentence embedding (384-dim) on the title.
-- **Tabular branch:** subscriber count (log-scaled), trailing average views (log-scaled), duration, title-derived stats, one-hot genre.
-- **Fusion:** each branch → its own small projection layer → concatenated → MLP regression head → single scalar (the relative-performance target).
+**Metrics:** Spearman rank correlation (the honest metric for "will thumbnail A beat thumbnail B"), AUC for over- vs. under-performing the channel baseline, and error in target space (plus RMSE/MAE in view space via `invert_target`).
 
-Both encoders are **fully frozen** in v1 — only the projections and fusion head are trained. Embeddings are precomputed once (`models/precompute_embeddings.py`) and cached, since frozen encoders produce the same output every epoch; re-running them repeatedly during training would be pure waste.
+### Results
 
-**Split:** time-based (train on earliest videos, validate/test on most recent finalized ones) — matches real deployment (predicting forward) and avoids random-split leakage across near-duplicate time windows.
+Mean ± std over seeds on the same 1,060-row test split (`experiments/results.jsonl`, 23 runs):
 
-**Loss:** Huber (robust to view-count outliers). **Early stopping** on validation loss (patience=5) to avoid training past the overfitting point — only the best checkpoint by val loss is kept.
+| Text encoder | `clip_sim` | Seeds | Test Spearman | Test AUC | Test MAE (target) |
+|---|---|---|---|---|---|
+| CLIP | off | 6 | 0.335 ± 0.015 | 0.644 | 0.490 |
+| CLIP | on | 6 | 0.333 ± 0.016 | 0.640 | 0.488 |
+| MiniLM | off | 6 | 0.321 ± 0.012 | 0.641 | 0.484 |
+| MiniLM | on | 5 | 0.327 ± 0.003 | 0.643 | 0.486 |
 
-**Evaluation metrics:**
-- RMSE, converted back to raw view-count space via `invert_target`
-- **Spearman rank correlation** between predicted and actual relative performance — arguably the more honest metric for this task, since the real use case ("will thumbnail A beat thumbnail B") is fundamentally a ranking question, not a point-estimate one.
+### Ablations
 
-## Planned — v2: Early Fusion
+**Modality ablation** (`models/ablation_modalities.py`, single seed, same test split; seed noise is about ±0.015 Spearman, so treat gaps as suggestive):
 
-Once v1's pipeline is proven and enough data has accumulated, build a cross-attention transformer over image patch tokens + title tokens jointly (rather than separately-pooled embeddings), to capture thumbnail/title *mismatch* signals late fusion can't see (e.g. clickbait where the two don't agree). Compared empirically against v1 on the same accumulated dataset — architecture choice justified by measured improvement, not assumed.
+| Variant | Test Spearman | Test AUC |
+|---|---|---|
+| tabular only (subs, trailing views, duration, genre) | 0.277 | 0.624 |
+| tabular + image | 0.302 | 0.630 |
+| tabular + text | 0.308 | 0.630 |
+| full fusion | 0.317 | 0.636 |
 
-## Planned — Continuous Training Infrastructure
+Most of the skill comes from channel-level features. Thumbnail and title add roughly +0.04 Spearman together.
 
-- **Orchestration:** Airflow DAGs for scheduled ingestion, delayed-label refresh, and retraining triggers.
-- **Compute:** Docker containers on AWS EC2 (spot instances for training cost control).
-- **Drift monitoring:** track prediction error and feature distributions over time; YouTube's algorithm and audience behavior genuinely shift over months, giving real (not synthetic) retraining triggers.
-- **Storage at scale:** S3 for images, Postgres (self-hosted on the same EC2 instance, or RDS free tier) for structured data — deliberately avoiding a second managed-service vendor (Supabase/Oracle/Neon were evaluated and dropped) since consolidating onto one cloud reduces operational surface area without a compelling technical reason to split it.
-- **Serving:** FastAPI + Docker, with the encoders exported to ONNX and quantized (fp16/int8) for a lightweight, free-tier-friendly deployment footprint — same technique already used in a prior project (Speech2Market) to hit a memory-constrained deployment target.
+**Visual tabular features** (`models/ablation_visual_flags.py`, 5 seeds, embeddings held fixed, only tabular columns removed):
+
+| Variant | Spearman (mean ± std) | AUC (mean ± std) | Paired Δ Spearman vs full |
+|---|---|---|---|
+| full | 0.339 ± 0.016 | 0.646 ± 0.012 | |
+| no face / text-overlay | 0.325 ± 0.018 | 0.631 ± 0.010 | −0.013 ± 0.030 |
+| no face / text-overlay / color stats | 0.346 ± 0.008 | 0.646 ± 0.004 | +0.007 ± 0.018 |
+
+No evidence that face, OCR or color-stat features help; the differences are within noise and non-monotonic. Decision: drop all seven visual tabular columns from training and serving (see Roadmap).
+
+All rows use the CLIP ViT-B/32 image encoder. Differences between these configurations are within seed-to-seed noise, so there is no evidence yet that one text encoder or the similarity feature is better. The signal is real but modest. `models/baseline.py` and `models/inspect_target_and_baseline.py` compare against naive, linear, Ridge and LightGBM baselines on the identical split; run them to see how much of the score comes from the image and text branches rather than from `trailing_avg_views` alone.
+
+## Known limitations (tracked, not hidden)
+
+- **`subscriber_count_at_upload` is the current subscriber count**, not the value at publish time. `ingestion/tubecensus_client.py` is a stub that returns the fallback; the TubeCensus integration was shelved (large local storage requirement, Windows permission issues). The deployment plan fixes this going forward by snapshotting channel state at ingest time. Old rows keep the approximation.
+- **Label timing is not a fixed horizon.** Today `label_finalized` flips once a video is ≥28 days old *at the time of an ingestion run*, and views are whatever the API returns at that moment. For backfilled videos that can be many months, not day 28. The planned redesign ingests right after publish and reads views once at day 28.
+- **Trailing baseline in incremental runs (found in code review, verify before relying on it).** `compute_trailing_views` runs over only the videos fetched in the current run, and already-finalized videos are excluded from that fetch. On re-runs, the baseline for newly fetched videos may therefore be computed from a truncated history. Computing it from the full per-channel history (e.g. in Postgres) is part of the redesign.
+- **`is_first_video`** means the first video in our fetched 2025+ window for that channel, not the channel's first upload ever.
+- **Visual tabular features are heavy and showed no measurable benefit.** MTCNN and EasyOCR dominate the size and dependency risk of any serving image, and the 5-seed ablation above found no gain from face, text-overlay or color-stat features. They are being removed from training and serving. The code (`features/visual_features.py`, `models/precompute_visual_features.py`) stays in the repo for experiments, and `load_data()` in `models/train.py` still requires `data/visual_features.csv` until that change lands.
+- **Checkpoint format is not serving-ready.** `train.py` saves weights plus a pickled sklearn scaler tuple, but not the feature column order (implied by module-level lists in `models/dataset.py`, one of which `load_data()` mutates when `USE_SIM=1`). Serving needs a versioned bundle (weights, scalers, column order, encoder names) and a parity test against the training path.
+- **Delayed labels:** rows are only used for training when `label_finalized` is true, and finalized rows are never re-fetched.
+- Ingestion re-runs are idempotent and incremental: thumbnails are skipped if already downloaded, and finalized `video_id`s are excluded from the `videos.list` fetch.
+
+## Deployment plan (planned, not yet implemented)
+
+### Infrastructure
+
+- **One Oracle Cloud Always Free Ampere A1 VM (2 OCPU / 12 GB, arm64)** running Docker Compose: Caddy (HTTPS), FastAPI, Postgres, Airflow, and a worker image. Oracle halved the Always Free A1 allowance from 4 OCPU / 24 GB to 2 OCPU / 12 GB in June 2026, so the design targets the smaller size. Idle Always Free instances can be reclaimed (CPU, network and memory all under 20% for 7 days), and the free tier is not a guarantee, so **everything must be rebuildable and backed up off the VM.**
+- Airflow decides when and in what order jobs run. Worker containers do the work (`DockerOperator`), so torch/pandas pins don't conflict with Airflow's.
+- No AWS unless training v2 needs a GPU spot instance (Airflow launches it, S3 for artifacts).
+- Keep the compose file portable: the same file should run on EC2 if the free tier changes again.
+- Build `linux/arm64` images (buildx, or build on the VM).
+
+### Storage
+
+- **Postgres:** two databases, `airflow` and app data (videos, features, run logs, model registry). Replaces `videos.csv`.
+- **Block volume:** thumbnails, embeddings, checkpoints, model caches. Nightly `pg_dump` and checkpoint backup off the VM.
+
+### DAGs
+
+| DAG | When | Does |
+|---|---|---|
+| `ingest_new` | daily | videos not in DB yet: thumbnail, title, channel snapshot (subs, baseline) at ingest time |
+| `embed_new` | after ingest | CLIP image and text embeddings for rows missing them (idempotent) |
+| `finalize_labels` | daily | read views at ~28 days, set `label_finalized`, never rewrite |
+| `retrain` | periodic or on drift | build dataset, train challenger, gate, compare, promote or reject |
+| `monitor_drift` | weekly | error on newly finalized videos plus feature shift; can trigger `retrain` |
+| `backup` | nightly | `pg_dump` and checkpoints off the VM |
+
+Rules: idempotent tasks, heavy tasks in a pool of size 1, `max_active_runs=1`, retries with backoff, log every run.
+
+### Retrain and promotion
+
+- Chronological split by `published_at`. The test slice is a fixed recent time window (not a fraction), so champion and challenger score on the same rows, and it must be newer than anything the champion trained on (`train_end` stored in the registry).
+- Re-score the champion on that slice every time; never compare against its stored old metrics.
+- Skip the run if there aren't enough new finalized rows.
+- **Hard gate:** no NaNs, checkpoint loads with the right dimensions, prediction spread not ~0, beats the constant-mean baseline, Spearman > 0.
+- **Soft comparison:** paired bootstrap 95% CI of ΔSpearman (challenger − champion) on shared rows. Reject only if the whole CI is below 0; otherwise promote, and ties go to the newer model. Small slices are noisy (Spearman on ~200 rows is roughly ±0.07), so "must beat the champion" would freeze the model on stale data.
+- Keep the previous champion for rollback and log every candidate's metrics.
+
+### Inference
+
+- FastAPI takes thumbnail + title + channel, computes the same features as training, and returns the predicted score, expected views and model version.
+- Channel baseline and subscriber count come from Postgres; for unseen channels the caller supplies them.
+- **Model bundle** = weights + fitted scalers + feature column order, versioned together. Encoder weights baked into the image. Champion loaded at startup and reloaded on promotion.
+- Rate-limit `/predict`.
+
+### Security
+
+Airflow UI behind auth. Postgres never public. Secrets in `.env`, not in images. SSH key-only.
+
+## Roadmap
+
+1. Remove the seven visual tabular columns from `models/dataset.py`, make the visual-features merge/filter in `load_data()` optional, and retrain on the same rows to confirm the baseline.
+2. Export a versioned model bundle from `train.py` and add a train/serve parity test.
+3. Slim serving requirements and an arm64 Dockerfile; deploy Caddy + FastAPI to the Oracle VM.
+4. Move `videos.csv` into Postgres; turn ingest, embed and finalize into containerized CLI commands.
+5. Wrap those commands in Airflow DAGs; add `backup`.
+6. Add `retrain` with the promotion logic above, then `monitor_drift`.
+7. **v2, early fusion:** cross-attention transformer over image patch tokens and title tokens jointly, to capture thumbnail/title mismatch signals late fusion can't see. To be compared against v1 on the same data; adopted only if measurably better.
+
+### Open decisions
+
+- ~~Face/OCR features at serving~~ Decided: drop, based on the ablation above.
+- Serve CLIP only (image + text towers) and drop MiniLM/DINOv2 from the serving image, since the encoder differences above are within noise.
+- Retrain cadence, minimum new rows, and test-slice length.
+- Rejection rule: strictly "CI below 0", or with a small margin.
+- v2 training: local GPU or AWS spot.
 
 ## Repo structure
 
 ```
-ingestion/          YouTube API client, thumbnail downloader, subscriber lookup
-features/           Title feature engineering, trailing views, target computation
-pipeline/           Orchestration script tying ingestion + features together
-models/             Embedding precomputation, dataset, late fusion architecture, training
-data/                Local dataset output (gitignored: images/, videos.csv, embeddings/)
+ingestion/     YouTube API client, thumbnail downloader, subscriber lookup (TubeCensus stub)
+features/      Title features, trailing views, target, visual features (faces, OCR, color)
+pipeline/      run_ingestion.py and config/ (channels.json, cum_channels.json)
+models/
+  precompute_embeddings.py        frozen image/text embeddings, cached
+  precompute_visual_features.py   face / text-overlay / color features, cached
+  dataset.py                      tabular matrix assembly + torch Dataset
+  late_fusion_model.py            LateFusionModel (+ standalone shape test)
+  train.py                        training, evaluation, experiment logging
+  baseline.py                     naive / linear / fusion comparison
+  inspect_target_and_baseline.py  target diagnostics, Ridge / LightGBM comparison
+  ablation_modalities.py          tabular / text / image / full-fusion ablation
+  ablation_visual_flags.py        multi-seed test of face / OCR / color tabular features
+experiments/   results.jsonl (one line per training run)
+data/          local dataset output (gitignored: images/, videos.csv, embeddings/, ...)
+current_EDA.ipynb
 ```
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-train.txt
 ```
+
+`requirements-train.txt` is a full training/dev freeze: it pins CUDA builds of torch (`+cu128`), Jupyter, and TubeCensus-related packages. A slim serving requirements file is planned and is part of the deployment work.
 
 Set in `.env` (loaded via `python-dotenv`, must load before any project imports):
 ```
@@ -114,26 +226,25 @@ YOUTUBE_API_KEY=your_key_here
 ## Running it
 
 ```bash
-# 1. Ingest data (incremental -- safe to re-run as CHANNELS grows)
+# 1. Ingest data (incremental; safe to re-run)
 python -m pipeline.run_ingestion
 
 # 2. Sanity-check the model architecture (no data or pretrained weights needed)
 python models/late_fusion_model.py
 
-# 3. Precompute frozen embeddings (one-time, or after adding new data)
+# 3. Precompute frozen embeddings (default: CLIP ViT-B/32 image, MiniLM + CLIP text)
 python -m models.precompute_embeddings
+#    other options: --image-encoder dinov2|clip_b16, --text-encoder minilm|clip|both,
+#                   --image-mode squash|crop, --limit N (smoke test)
 
-# 4. Precompute visual-related features (has_face, overlays, etc.)
-python -m models.precompute_visual_features
-
-# 5. Train
+# 4. Train (env vars: IMAGE_ENCODER, TEXT_ENCODER, USE_SIM, SEED)
 python -m models.train
+IMAGE_ENCODER=clip_b32 TEXT_ENCODER=minilm USE_SIM=1 SEED=3 python -m models.train
 
-# 6. Ablation tests
-python -m models.ablation_tabular_only
+# 5. Baselines, diagnostics and ablations
+python -m models.baseline
 python -m models.inspect_target_and_baseline
+python -m models.ablation_modalities
 ```
 
-## Status
-
-v1 late fusion model runs end-to-end on ~6,800 finalized rows. Actively iterating on regularization (dropout/weight decay) to address overfitting observed after ~epoch 7 on the first full run.
+Each training run appends its config and test metrics to `experiments/results.jsonl` and saves the best checkpoint to `models/checkpoints/late_fusion_v1_<image_encoder>[_<text_encoder>][_sim].pt`.

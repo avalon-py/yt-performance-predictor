@@ -45,8 +45,8 @@ TITLE_NUMERIC_COLS = [
 ]
 TITLE_BOOL_COLS = ["title_has_question_mark", "title_has_number"]
 
-VIDEO_NUMERIC_COLS = ["face_count", "mean_saturation", "mean_brightness", "brightness_std", "warm_hue_ratio"]
-VIDEO_BOOL_COLS = ["has_face", "has_text_overlay"]
+VIDEO_NUMERIC_COLS = []
+VIDEO_BOOL_COLS = []
 
 VARIANTS = {
     "tabular_only":  {"include_title": False, "include_video": False, "use_image": False, "use_text": False},

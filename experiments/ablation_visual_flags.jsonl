@@ -1,0 +1,15 @@
+{"variant": "full", "seed": 1, "n_test": 1060, "spearman": 0.32243006120477374, "auc": 0.6327578023021242, "best_epoch": 96, "tabular_dim": 31}
+{"variant": "no_face_ocr", "seed": 1, "n_test": 1060, "spearman": 0.34630017991210077, "auc": 0.6430520944582888, "best_epoch": 76, "tabular_dim": 28}
+{"variant": "no_visual_tabular", "seed": 1, "n_test": 1060, "spearman": 0.3524760419881886, "auc": 0.6506133558799098, "best_epoch": 86, "tabular_dim": 24}
+{"variant": "full", "seed": 2, "n_test": 1060, "spearman": 0.32139251250702194, "auc": 0.6340853803251454, "best_epoch": 84, "tabular_dim": 31}
+{"variant": "no_face_ocr", "seed": 2, "n_test": 1060, "spearman": 0.3311118364308679, "auc": 0.628986442387564, "best_epoch": 87, "tabular_dim": 28}
+{"variant": "no_visual_tabular", "seed": 2, "n_test": 1060, "spearman": 0.3419597205052692, "auc": 0.6408753114987541, "best_epoch": 80, "tabular_dim": 24}
+{"variant": "full", "seed": 3, "n_test": 1060, "spearman": 0.3509163638199198, "auc": 0.6545107986234722, "best_epoch": 91, "tabular_dim": 31}
+{"variant": "no_face_ocr", "seed": 3, "n_test": 1060, "spearman": 0.29881517355273474, "auc": 0.618061736086389, "best_epoch": 117, "tabular_dim": 28}
+{"variant": "no_visual_tabular", "seed": 3, "n_test": 1060, "spearman": 0.33698837732463705, "auc": 0.6464192476563426, "best_epoch": 69, "tabular_dim": 24}
+{"variant": "full", "seed": 4, "n_test": 1060, "spearman": 0.3437789420173016, "auc": 0.6529050967129464, "best_epoch": 80, "tabular_dim": 31}
+{"variant": "no_face_ocr", "seed": 4, "n_test": 1060, "spearman": 0.31814003945240177, "auc": 0.6271841995965349, "best_epoch": 94, "tabular_dim": 28}
+{"variant": "no_visual_tabular", "seed": 4, "n_test": 1060, "spearman": 0.341524592462291, "auc": 0.6476986175388632, "best_epoch": 94, "tabular_dim": 24}
+{"variant": "full", "seed": 5, "n_test": 1060, "spearman": 0.35552158564862324, "auc": 0.6561795419484988, "best_epoch": 107, "tabular_dim": 31}
+{"variant": "no_face_ocr", "seed": 5, "n_test": 1060, "spearman": 0.3327237255311003, "auc": 0.6369444938886912, "best_epoch": 95, "tabular_dim": 28}
+{"variant": "no_visual_tabular", "seed": 5, "n_test": 1060, "spearman": 0.35609346764365524, "auc": 0.6457480420078319, "best_epoch": 113, "tabular_dim": 24}
