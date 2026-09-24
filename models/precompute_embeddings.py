@@ -3,10 +3,12 @@ Precompute frozen image and title embeddings ONCE, cache to disk. Encoders are
 frozen, so re-running them every epoch would be pure waste.
 
 Usage:
-    python -m models.precompute_embeddings                                              # CLIP ViT-B/32 (default)
-    python -m models.precompute_embeddings --image-encoder dinov2                       # DINOv2
+    python -m models.precompute_embeddings                                             # CLIP ViT-B/32 image, MiniLM+CLIP text (default)
+    python -m models.precompute_embeddings --image-encoder dinov2                       # DINOv2 image, MiniLM+CLIP text
+    python -m models.precompute_embeddings --image-encoder dinov2 --text-encoder clip   # DINOv2 image + CLIP text only, no MiniLM
+    python -m models.precompute_embeddings --text-encoder clip                          # skip MiniLM entirely
     python -m models.precompute_embeddings --image-encoder clip_b32 --image-mode crop
-    python -m models.precompute_embeddings --image-encoder clip_b32 --limit 200         # Smoke test for 200 rows
+    python -m models.precompute_embeddings --image-encoder clip_b32 --limit 200         # smoke test
 
 Each run writes to its own folder, data/embeddings/<encoder>[_crop][_smoketest]/,
 plus a meta.json, so encoders never overwrite each other.
@@ -30,6 +32,7 @@ from torchvision.transforms import InterpolationMode
 CSV_PATH = "data/videos.csv"
 EMBEDDINGS_ROOT = "data/embeddings"
 TEXT_MODEL_NAME = "all-MiniLM-L6-v2"
+DEFAULT_CLIP_TEXT_MODEL = "openai/clip-vit-base-patch32"
 
 IMAGENET_MEAN, IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -128,6 +131,18 @@ def embed_titles(df, text_encoder, batch_size=64):
     return embeddings.astype(np.float32)
 
 
+def load_clip_text_tower(hf_name, device):
+    """Loads just what's needed for title embeddings via CLIP's text tower --
+    used when the chosen image encoder isn't CLIP, so CLIP text embeddings
+    don't require also encoding images with CLIP."""
+    from transformers import CLIPModel
+    model = CLIPModel.from_pretrained(hf_name)
+    model.eval().to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
 def embed_titles_clip(df, clip_model, hf_name, device, batch_size=256):
     """Titles through CLIP's own text tower, same space as the CLIP image embeddings."""
     from transformers import AutoTokenizer
@@ -149,6 +164,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image-encoder", choices=list(ENCODERS), default="clip_b32")
     parser.add_argument("--image-mode", choices=["squash", "crop"], default="squash")
+    parser.add_argument("--text-encoder", choices=["minilm", "clip", "both"], default="both",
+                         help="which title embedding(s) to compute. 'both' keeps MiniLM available "
+                              "for comparison/ablation even though CLIP text has been outperforming it.")
+    parser.add_argument("--clip-text-model", default=DEFAULT_CLIP_TEXT_MODEL,
+                         help="CLIP checkpoint used for title embeddings when --image-encoder isn't "
+                              "a CLIP variant, or to force a specific text tower regardless of image encoder.")
     parser.add_argument("--limit", type=int, default=None, help="only embed the first N rows (smoke test)")
     args = parser.parse_args()
 
@@ -173,28 +194,48 @@ def main():
     image_embeddings, valid_mask = embed_images(df, encode, transform, cfg, device)
     image_embeddings = postprocess(image_embeddings, cfg)
 
-    print("Loading title encoder (MiniLM)...")
-    text_encoder = SentenceTransformer(TEXT_MODEL_NAME)
-    print("Embedding titles...")
-    text_embeddings = embed_titles(df, text_encoder)
-
     np.save(os.path.join(out_dir, "image_embeddings.npy"), image_embeddings)
-    np.save(os.path.join(out_dir, "text_embeddings.npy"), text_embeddings)
     np.save(os.path.join(out_dir, "valid_image_mask.npy"), valid_mask)
     df[["video_id"]].to_csv(os.path.join(out_dir, "video_id_order.csv"), index=False)
 
-    if clip_model is not None:
-        print("Embedding titles with CLIP's text tower (for thumbnail-title similarity)...")
-        clip_text = postprocess(embed_titles_clip(df, clip_model, cfg["hf_name"], device), cfg)
+    want_minilm = args.text_encoder in ("minilm", "both")
+    want_clip_text = args.text_encoder in ("clip", "both")
+    text_dim = None
+
+    if want_minilm:
+        print("Loading title encoder (MiniLM)...")
+        text_encoder = SentenceTransformer(TEXT_MODEL_NAME)
+        print("Embedding titles (MiniLM)...")
+        text_embeddings = embed_titles(df, text_encoder)
+        np.save(os.path.join(out_dir, "text_embeddings.npy"), text_embeddings)
+        text_dim = text_embeddings.shape[1]
+
+    if want_clip_text:
+        # Reuse the already-loaded CLIP model when the image encoder is CLIP
+        # (free byproduct, same as before); otherwise load just the text
+        # tower separately -- CLIP text embeddings no longer require also
+        # encoding images with CLIP.
+        if clip_model is not None:
+            text_tower, text_tower_name = clip_model, cfg["hf_name"]
+        else:
+            print(f"Loading separate CLIP text tower ({args.clip_text_model}) for titles...")
+            text_tower, text_tower_name = load_clip_text_tower(args.clip_text_model, device), args.clip_text_model
+
+        print("Embedding titles (CLIP text tower)...")
+        clip_text = postprocess(
+            embed_titles_clip(df, text_tower, text_tower_name, device), {"rescale": True}
+        )
         np.save(os.path.join(out_dir, "clip_text_embeddings.npy"), clip_text)
+        text_dim = text_dim or clip_text.shape[1]
 
     meta = {
         "image_encoder": args.image_encoder,
         "image_mode": args.image_mode,
         "image_dim": int(image_embeddings.shape[1]),
         "rescaled_to_unit_rms": cfg["rescale"],
-        "text_encoder": TEXT_MODEL_NAME,
-        "text_dim": int(text_embeddings.shape[1]),
+        "text_encoders_saved": [n for n, w in [("minilm", want_minilm), ("clip", want_clip_text)] if w],
+        "clip_text_model": args.clip_text_model if want_clip_text else None,
+        "text_dim": int(text_dim) if text_dim is not None else None,
         "n_rows": int(len(df)),
         "n_valid_images": int(valid_mask.sum()),
     }
@@ -204,8 +245,6 @@ def main():
     print(f"\nDone. {valid_mask.sum()}/{len(df)} rows have valid image embeddings.")
     print(f"image embeddings: shape={image_embeddings.shape}, "
           f"mean per-dim std={image_embeddings[valid_mask].std(axis=0).mean():.3f}")
-    print(f"text embeddings:  shape={text_embeddings.shape}, "
-          f"mean per-dim std={text_embeddings.std(axis=0).mean():.3f}")
     print(f"Saved to {out_dir}/")
 
 
