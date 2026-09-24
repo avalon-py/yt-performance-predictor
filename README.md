@@ -237,14 +237,11 @@ python -m models.precompute_embeddings
 #    other options: --image-encoder dinov2|clip_b16, --text-encoder minilm|clip|both,
 #                   --image-mode squash|crop, --limit N (smoke test)
 
-# 4. Precompute visual features (has_face, text overlay, color stats)
-python -m models.precompute_visual_features
-
-# 5. Train (env vars: IMAGE_ENCODER, TEXT_ENCODER, USE_SIM, SEED)
+# 4. Train (env vars: IMAGE_ENCODER, TEXT_ENCODER, USE_SIM, SEED)
 python -m models.train
 IMAGE_ENCODER=clip_b32 TEXT_ENCODER=minilm USE_SIM=1 SEED=3 python -m models.train
 
-# 6. Baselines, diagnostics and ablations
+# 5. Baselines, diagnostics and ablations
 python -m models.baseline
 python -m models.inspect_target_and_baseline
 python -m models.ablation_modalities
