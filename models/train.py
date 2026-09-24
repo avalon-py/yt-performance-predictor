@@ -27,10 +27,15 @@ from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS,
 from models.late_fusion_model import LateFusionModel
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
-IMAGE_ENCODER = os.environ.get("IMAGE_ENCODER", "clip_b32")
+IMAGE_ENCODER = os.environ.get("IMAGE_ENCODER", "clip_b32") # Option: dinov2 | clip_b32
+TEXT_ENCODER = os.environ.get("TEXT_ENCODER", "clip") # Option: minilm | clip
+USE_SIM = os.environ.get("USE_SIM", "0") == "1"
+TEXT_FILES = {"minilm": "text_embeddings.npy", "clip": "clip_text_embeddings.npy"}
+
+_suffix = ("" if TEXT_ENCODER == "minilm" else f"_{TEXT_ENCODER}") + ("_sim" if USE_SIM else "")
 SEED = int(os.environ.get("SEED", 42))
 EMBEDDINGS_DIR = os.path.join("data/embeddings", IMAGE_ENCODER)
-CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}.pt"
+CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}{_suffix}.pt"
 RESULTS_PATH = "experiments/results.jsonl"
 CSV_PATH = "data/videos.csv"
 VISUAL_FEATURES_PATH = "data/visual_features.csv"
@@ -47,6 +52,11 @@ DROPOUT = 0.2
 EMBEDDING_NOISE_STD = 0.02
 SPEARMAN_SMOOTHING_WINDOW = 5
 
+def cosine_rows(a, b):
+    a = a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-8)
+    b = b / np.maximum(np.linalg.norm(b, axis=1, keepdims=True), 1e-8)
+    return (a * b).sum(axis=1)
+
 def load_data():
     df = pd.read_csv(CSV_PATH)
     df["label_finalized"] = df["label_finalized"].astype(str) == "True"
@@ -60,7 +70,7 @@ def load_data():
     df = df.merge(visual, on="video_id", how="left")
 
     image_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "image_embeddings.npy"))
-    text_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "text_embeddings.npy"))
+    text_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, TEXT_FILES[TEXT_ENCODER]))
     valid_image_mask = np.load(os.path.join(EMBEDDINGS_DIR, "valid_image_mask.npy"))
     video_id_order = pd.read_csv(os.path.join(EMBEDDINGS_DIR, "video_id_order.csv"))
 
@@ -80,6 +90,12 @@ def load_data():
     idxs = df["_embed_idx"].values
     image_embeddings = image_embeddings[idxs]
     text_embeddings = text_embeddings[idxs]
+    if USE_SIM:
+        assert IMAGE_ENCODER.startswith("clip"), "similarity needs CLIP image + CLIP text (shared space)"
+        clip_text = np.load(os.path.join(EMBEDDINGS_DIR, "clip_text_embeddings.npy"))[idxs]
+        df["clip_sim"] = cosine_rows(image_embeddings, clip_text)
+        if "clip_sim" not in TABULAR_NUMERIC_COLS:
+            TABULAR_NUMERIC_COLS.append("clip_sim")   # shared list, so build_tabular_matrix picks it up
 
     df["has_face"] = df["has_face"].astype(str) == "True"
     df["has_text_overlay"] = df["has_text_overlay"].astype(str) == "True"
@@ -294,6 +310,8 @@ def main():
                 "val_spearman_raw": val_spearman,
                 "val_spearman_smoothed": smoothed_spearman,
                 "image_encoder": IMAGE_ENCODER,
+                "text_encoder": TEXT_ENCODER,
+                "use_sim": USE_SIM,
             }, CHECKPOINT_PATH)
         else:
             epochs_without_improvement += 1
@@ -354,10 +372,11 @@ def main():
             "test_auc": float(auc),
             "test_mae_target": float(mae_target_scale),
             "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx),
+            "text_encoder": TEXT_ENCODER, "use_sim": USE_SIM,
         }) + "\n")
 
     os.makedirs("experiments/preds", exist_ok=True)
-    np.savez(f"experiments/preds/{IMAGE_ENCODER}_s{SEED}.npz",
+    np.savez(f"experiments/preds/{IMAGE_ENCODER}_{TEXT_ENCODER}_sim{int(USE_SIM)}_s{SEED}.npz",
              video_id=test_sub["video_id"].values, pred=preds, target=targets)
 
 
