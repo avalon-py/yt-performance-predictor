@@ -26,10 +26,12 @@ from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
 from models.train import (
-    load_data, time_based_split,
+    load_data, time_based_split, set_seed,
     BATCH_SIZE, EPOCHS, LEARNING_RATE, EARLY_STOP_PATIENCE,
-    WEIGHT_DECAY, DROPOUT, EMBEDDING_NOISE_STD,
+    WEIGHT_DECAY, DROPOUT, EMBEDDING_NOISE_STD, SEED,
 )
+from models.dataset import build_tabular_matrix
+from models.late_fusion_model import LateFusionModel
 from features.target import invert_target
 
 CHECKPOINT_DIR = "models/checkpoints/ablations"
@@ -52,6 +54,13 @@ VARIANTS = {
     "tabular_image": {"include_title": False, "include_video": True,  "use_image": True,  "use_text": False},
     "full_fusion":   {"include_title": True,  "include_video": True,  "use_image": True,  "use_text": True},
 }
+
+# full_fusion uses every modality -- identical conditions to train.py's model --
+# so it is built and trained with the *exact same* LateFusionModel class and
+# build_tabular_matrix() as train.py, instead of the ablation-only AblationModel.
+# Everything else about VARIANTS still uses AblationModel, since dropping a
+# whole branch (image, text, or both) isn't something LateFusionModel supports.
+FULL_FUSION_VARIANT = "full_fusion"
 
 
 def build_variant_tabular_matrix(df, genre_categories, include_title, include_video, scaler=None, fit_scaler=False):
@@ -154,6 +163,14 @@ class AblationModel(nn.Module):
 
 
 def forward_batch(model, batch, device):
+    if isinstance(model, LateFusionModel):
+        # Same call convention as train.py's train_epoch/evaluate -- full_fusion
+        # always has both embeddings present, so this is never ambiguous.
+        return model(
+            batch["image_embedding"].to(device),
+            batch["text_embedding"].to(device),
+            batch["tabular"].to(device),
+        )
     kwargs = {"tabular": batch["tabular"].to(device)}
     if "image_embedding" in batch:
         kwargs["image_embedding"] = batch["image_embedding"].to(device)
@@ -214,16 +231,25 @@ def compute_metrics(preds, targets, trailing_avg_views, actual_views):
 
 def run_variant(name, config, df, train_idx, val_idx, test_idx, image_embeddings, text_embeddings, device):
     genre_categories = sorted(df.iloc[train_idx]["genre"].dropna().unique().tolist())
+    is_full_fusion = (name == FULL_FUSION_VARIANT)
 
-    train_tabular, scaler = build_variant_tabular_matrix(
-        df.iloc[train_idx], genre_categories, config["include_title"], config["include_video"], fit_scaler=True
-    )
-    val_tabular, _ = build_variant_tabular_matrix(
-        df.iloc[val_idx], genre_categories, config["include_title"], config["include_video"], scaler=scaler
-    )
-    test_tabular, _ = build_variant_tabular_matrix(
-        df.iloc[test_idx], genre_categories, config["include_title"], config["include_video"], scaler=scaler
-    )
+    if is_full_fusion:
+        # Same tabular columns/order and same scaler-fitting procedure train.py uses --
+        # not the ablation-only build_variant_tabular_matrix, even though today they'd
+        # produce equivalent output for this particular variant.
+        train_tabular, scaler = build_tabular_matrix(df.iloc[train_idx], genre_categories, fit_scaler=True)
+        val_tabular, _ = build_tabular_matrix(df.iloc[val_idx], genre_categories, scaler=scaler)
+        test_tabular, _ = build_tabular_matrix(df.iloc[test_idx], genre_categories, scaler=scaler)
+    else:
+        train_tabular, scaler = build_variant_tabular_matrix(
+            df.iloc[train_idx], genre_categories, config["include_title"], config["include_video"], fit_scaler=True
+        )
+        val_tabular, _ = build_variant_tabular_matrix(
+            df.iloc[val_idx], genre_categories, config["include_title"], config["include_video"], scaler=scaler
+        )
+        test_tabular, _ = build_variant_tabular_matrix(
+            df.iloc[test_idx], genre_categories, config["include_title"], config["include_video"], scaler=scaler
+        )
 
     use_image, use_text = config["use_image"], config["use_text"]
 
@@ -239,13 +265,23 @@ def run_variant(name, config, df, train_idx, val_idx, test_idx, image_embeddings
     val_loader = DataLoader(make_dataset(val_idx, val_tabular), batch_size=BATCH_SIZE)
     test_loader = DataLoader(make_dataset(test_idx, test_tabular), batch_size=BATCH_SIZE)
 
-    model = AblationModel(
-        tabular_dim=train_tabular.shape[1],
-        use_image=use_image, use_text=use_text,
-        image_dim=image_embeddings.shape[1] if use_image else None,
-        text_dim=text_embeddings.shape[1] if use_text else None,
-        dropout=DROPOUT, embedding_noise_std=EMBEDDING_NOISE_STD,
-    ).to(device)
+    if is_full_fusion:
+        # Exact same class, same proj_dim/tabular_proj_dim defaults (32/32), and same
+        # dropout/noise args as train.py -- not AblationModel's proj_dim=64 default.
+        model = LateFusionModel(
+            image_dim=image_embeddings.shape[1],
+            text_dim=text_embeddings.shape[1],
+            tabular_dim=train_tabular.shape[1],
+            dropout=DROPOUT, embedding_noise_std=EMBEDDING_NOISE_STD,
+        ).to(device)
+    else:
+        model = AblationModel(
+            tabular_dim=train_tabular.shape[1],
+            use_image=use_image, use_text=use_text,
+            image_dim=image_embeddings.shape[1] if use_image else None,
+            text_dim=text_embeddings.shape[1] if use_text else None,
+            dropout=DROPOUT, embedding_noise_std=EMBEDDING_NOISE_STD,
+        ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     loss_fn = torch.nn.HuberLoss()
@@ -289,12 +325,19 @@ def run_variant(name, config, df, train_idx, val_idx, test_idx, image_embeddings
 
 
 def main():
+    set_seed(SEED)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df, image_embeddings, text_embeddings = load_data()
     train_idx, val_idx, test_idx = time_based_split(df)
 
     results = []
     for name, config in VARIANTS.items():
+        # Re-seed before each variant (not just once before the loop) so that
+        # e.g. tabular_image's init/shuffling doesn't depend on how many random
+        # draws tabular_only and tabular_text happened to consume before it --
+        # each variant is reproducible independent of VARIANTS' dict order.
+        set_seed(SEED)
         print(f"\n=== Training variant: {name} ===")
         result = run_variant(name, config, df, train_idx, val_idx, test_idx, image_embeddings, text_embeddings, device)
         print(f"  Spearman={result['Spearman']:.4f}  AUC={result['AUC']:.4f}  "

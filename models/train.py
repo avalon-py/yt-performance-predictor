@@ -2,7 +2,6 @@
 Trains the late fusion head on cached embeddings + tabular features.
 
 Usage:
-    python -m models.precompute_embeddings   # run once, or after adding new data
     python -m models.train
 
 NOTE: not executed end-to-end in the environment that generated this file
@@ -28,7 +27,7 @@ from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS,
 from models.late_fusion_model import LateFusionModel
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
-IMAGE_ENCODER = os.environ.get("IMAGE_ENCODER", "dinov2")
+IMAGE_ENCODER = os.environ.get("IMAGE_ENCODER", "clip_b32")
 SEED = int(os.environ.get("SEED", 42))
 EMBEDDINGS_DIR = os.path.join("data/embeddings", IMAGE_ENCODER)
 CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}.pt"
