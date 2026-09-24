@@ -3,10 +3,10 @@ Precompute frozen image and title embeddings ONCE, cache to disk. Encoders are
 frozen, so re-running them every epoch would be pure waste.
 
 Usage:
-    python -m models.precompute_embeddings                              # DINOv2 (original behaviour)
-    python -m models.precompute_embeddings --image-encoder clip_b32
+    python -m models.precompute_embeddings                                              # CLIP ViT-B/32 (default)
+    python -m models.precompute_embeddings --image-encoder dinov2                       # DINOv2
     python -m models.precompute_embeddings --image-encoder clip_b32 --image-mode crop
-    python -m models.precompute_embeddings --image-encoder clip_b32 --limit 200   # smoke test
+    python -m models.precompute_embeddings --image-encoder clip_b32 --limit 200         # Smoke test for 200 rows
 
 Each run writes to its own folder, data/embeddings/<encoder>[_crop][_smoketest]/,
 plus a meta.json, so encoders never overwrite each other.
@@ -147,7 +147,7 @@ def embed_titles_clip(df, clip_model, hf_name, device, batch_size=256):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image-encoder", choices=list(ENCODERS), default="dinov2")
+    parser.add_argument("--image-encoder", choices=list(ENCODERS), default="clip_b32")
     parser.add_argument("--image-mode", choices=["squash", "crop"], default="squash")
     parser.add_argument("--limit", type=int, default=None, help="only embed the first N rows (smoke test)")
     args = parser.parse_args()
