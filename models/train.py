@@ -35,13 +35,13 @@ PLOTS_DIR = "models/plots"
 BATCH_SIZE = 64
 EPOCHS = 200
 LEARNING_RATE = 2e-5
-VAL_FRACTION = 0.2
-TEST_FRACTION = 0.15
+VAL_FRACTION = 0.1
+TEST_FRACTION = 0.1
 EARLY_STOP_PATIENCE = 10
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.2
 EMBEDDING_NOISE_STD = 0.02
-SPEARMAN_SMOOTHING_WINDOW = 5  # still used for the plotted/reported smoothed Spearman, not for stopping
+SPEARMAN_SMOOTHING_WINDOW = 5
 
 def load_data():
     df = pd.read_csv(CSV_PATH)
