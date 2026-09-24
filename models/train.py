@@ -19,6 +19,8 @@ from torch.utils.data import DataLoader
 from scipy.stats import spearmanr
 from collections import deque
 import matplotlib.pyplot as plt
+import json
+import random
 
 
 from features.target import compute_target, invert_target
@@ -26,10 +28,13 @@ from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS,
 from models.late_fusion_model import LateFusionModel
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
+IMAGE_ENCODER = os.environ.get("IMAGE_ENCODER", "dinov2")
+SEED = int(os.environ.get("SEED", 42))
+EMBEDDINGS_DIR = os.path.join("data/embeddings", IMAGE_ENCODER)
+CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}.pt"
+RESULTS_PATH = "experiments/results.jsonl"
 CSV_PATH = "data/videos.csv"
 VISUAL_FEATURES_PATH = "data/visual_features.csv"
-EMBEDDINGS_DIR = "data/embeddings"
-CHECKPOINT_PATH = "models/checkpoints/late_fusion_v1.pt"
 PLOTS_DIR = "models/plots"
 
 BATCH_SIZE = 64
@@ -186,8 +191,15 @@ def plot_training_curves(train_losses, val_losses, val_spearmans, smoothed_spear
 
     print(f"\nSaved training curves to {loss_path} and {spearman_path}")
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def main():
+    set_seed(SEED)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     df, image_embeddings, text_embeddings = load_data()
 
@@ -282,6 +294,7 @@ def main():
                 "val_loss": val_loss,
                 "val_spearman_raw": val_spearman,
                 "val_spearman_smoothed": smoothed_spearman,
+                "image_encoder": IMAGE_ENCODER,
             }, CHECKPOINT_PATH)
         else:
             epochs_without_improvement += 1
@@ -330,6 +343,24 @@ def main():
     print(f"AUC (overperform vs underperform baseline): {auc:.4f}")
     print(f"(Reference: constant train-mean predictor val_loss was {const_val_loss:.4f} -- "
           f"if best val_loss during training was close to that, revisit LR/regularization.)")
+
+    os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
+    with open(RESULTS_PATH, "a") as f:
+        f.write(json.dumps({
+            "image_encoder": IMAGE_ENCODER, "seed": SEED,
+            "best_epoch": checkpoint.get("epoch"),
+            "val_loss": float(checkpoint.get("val_loss", float("nan"))),
+            "test_loss": float(test_loss),
+            "test_spearman": float(spearman_corr),
+            "test_auc": float(auc),
+            "test_mae_target": float(mae_target_scale),
+            "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx),
+        }) + "\n")
+
+    os.makedirs("experiments/preds", exist_ok=True)
+    np.savez(f"experiments/preds/{IMAGE_ENCODER}_s{SEED}.npz",
+             video_id=test_sub["video_id"].values, pred=preds, target=targets)
+
 
 if __name__ == "__main__":
     main()
