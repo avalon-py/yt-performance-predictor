@@ -7,7 +7,7 @@ DINOv2 and MiniLM aren't shipped). A bundle trained with a different image or
 text encoder is rejected at load time rather than silently mishandled.
 
 Usage:
-    bundle = LoadedBundle("models/bundles/latest_clip_b32.pt")
+    bundle = LoadedBundle("models/bundles/latest_clip_b32_clip.pt")
     result = bundle.predict(
         thumbnail="data/images/abc123.jpg",   # path, bytes, or PIL.Image
         title="I Tried This For 30 Days",

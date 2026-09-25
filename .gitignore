@@ -1,4 +1,5 @@
 yt-performance-predictor
+deployment-env
 .env
 __pycache__/
 *.pyc
@@ -9,3 +10,6 @@ models/checkpoints/
 notes/
 experiments/preds/
 models/bundles/
+*.key
+*.key.pub
+predict_api_caller.txt
