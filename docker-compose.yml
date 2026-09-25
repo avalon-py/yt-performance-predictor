@@ -8,8 +8,13 @@ services:
       - ./models/bundles:/app/models/bundles:ro
     environment:
       - MODEL_BUNDLE_PATH=/app/models/bundles/latest_clip_b32_clip.pt
-    expose:
-      - "8000"
+      - HF_HUB_DISABLE_XET=1
+    # TEMP FOR LOCAL TESTING ONLY -- revert to `expose: ["8000"]` before
+    # deploying to Oracle. Publishing this port lets curl/anything on the
+    # host hit the api container directly, bypassing Caddy entirely --
+    # fine for local dev, not something prod should allow.
+    ports:
+      - "8000:8000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s

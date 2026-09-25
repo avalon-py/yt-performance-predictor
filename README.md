@@ -9,7 +9,8 @@ Predicts a YouTube video's relative performance (views vs. the channel's own rec
 | Ingestion, embeddings, late-fusion model + training | Built. ~10.6k rows, test Spearman ≈ 0.33 (see [Results](#results)) |
 | Model bundle export + train/serve parity test | Built and passing (0/200 samples outside tolerance) |
 | Serving (FastAPI, Dockerfile, requirements-serve.txt) | Built and validated locally (amd64) — containerized CPU predictions match the training path exactly |
-| Deployment (Oracle Cloud VM, Caddy, arm64) | Blocked on Oracle Always Free Ampere A1 capacity; `docker-compose.yml` + `Caddyfile` written, not yet live |
+| Docker Compose stack (api + Caddy) | Built and validated locally — both containers build and start cleanly, api healthcheck passes (`healthy`), `/health` confirmed reachable from Caddy over the internal Compose network |
+| Deployment (Oracle Cloud VM, Caddy, arm64) | Blocked on Oracle Always Free Ampere A1 capacity; `docker-compose.yml` + `Caddyfile` written and locally validated on amd64, not yet live on arm64 |
 | Postgres, Airflow, retrain/promotion, drift monitoring | Designed only, not built (see [Roadmap](#roadmap)) |
 
 ## What it predicts
@@ -81,8 +82,36 @@ Differences between encoders/`clip_sim` are within seed noise.
 
 `export_bundle()` (in `train.py`) packages weights, scalers, feature-column order, and encoder config into one versioned file; `tests/test_bundle_parity.py` checks the serving path reproduces it (passing, max diff 2.8e-3 vs. a 1e-2 bug threshold). Serving is **CLIP-only** — a bundle trained with a different encoder is rejected at load time.
 
+### Running it — Docker Compose (primary workflow)
+
+This is how the app actually runs, both locally and on the eventual Oracle VM: FastAPI behind Caddy, on Caddy's internal Docker network.
+
 ```bash
-# local build + run (amd64; swap --platform linux/arm64 for the Oracle VM)
+docker compose up -d --build
+docker compose ps          # api should show "healthy" after ~30s
+```
+
+The `api` service is intentionally **not** published to the host (`expose: ["8000"]`, not `ports:`) — only `caddy` is reachable from outside the Compose network, on 80/443. That's correct for production (nobody should be able to skip Caddy and hit the model directly), but it also means `curl http://localhost:8000/...` from the host will **not** connect, even when everything is healthy. To check the API directly during local dev, curl it from inside the Compose network instead:
+
+```bash
+docker compose exec caddy wget -qO- http://api:8000/health
+```
+
+`Caddyfile` is currently keyed to a real domain (`your-domain.example.com`), so Caddy itself won't respond to `localhost` until that's swapped for a real domain pointed at the VM. Since there's no domain to test against yet, Caddy itself can't be meaningfully exercised locally — only `api` can be.
+
+**Testing `/predict` locally with a real curl command (temporary, revert before deploying):** the `wget` trick above only works for simple GETs like `/health`; `/predict` needs multipart file upload, which is easiest to test the normal way from the host. To allow that, temporarily change `api`'s `expose: ["8000"]` in `docker-compose.yml` to:
+```yaml
+    ports:
+      - "8000:8000"
+```
+then `docker compose up -d` (no rebuild needed). This publishes the api port directly to the host, bypassing Caddy — convenient for local testing, but **it must be changed back to `expose: ["8000"]` before deploying to Oracle**. In production, nothing outside the Compose network should be able to reach `api` directly; only Caddy should be internet-facing. Don't ship this repo to the VM with `ports:` still set on `api`.
+
+### Running it — plain Docker (quick local smoke test only, no Caddy)
+
+Useful for a fast sanity check of the image itself without bringing up the whole stack — not the workflow this project actually deploys with.
+
+```bash
+# amd64 shown; swap --platform linux/arm64 for the Oracle VM
 docker build -t ytpp-api .
 docker run --rm -p 8000:8000 -v ./models/bundles:/app/models/bundles:ro ytpp-api
 
@@ -93,7 +122,9 @@ curl -X POST http://localhost:8000/predict \
   -F duration_seconds=612 -F genre=Entertainment
 ```
 
-`requirements-serve.txt` is hand-curated and exactly pinned (not a `pip freeze`) to only what `serving/` imports. torch/torchvision install from PyTorch's CPU-only wheel index in the Dockerfile (a plain install resolves to CUDA wheels the Ampere VM, no GPU, doesn't need). Full stack (Caddy + FastAPI) runs via `docker compose up -d --build` once a domain points at the VM — see `docker-compose.yml` / `Caddyfile`.
+Unlike the Compose workflow above, `-p 8000:8000` here does publish the port to the host directly, so plain `curl http://localhost:8000/...` works — but there's no Caddy/HTTPS in front of it, so this isn't representative of the deployed setup.
+
+`requirements-serve.txt` is hand-curated and exactly pinned (not a `pip freeze`) to only what `serving/` imports. torch/torchvision install from PyTorch's CPU-only wheel index in the Dockerfile (a plain install resolves to CUDA wheels the Ampere VM, no GPU, doesn't need).
 
 ## Deployment (planned infra)
 
@@ -105,11 +136,12 @@ One Oracle Cloud Always Free Ampere A1 VM (arm64; 1 OCPU/6GB to start — resiza
 
 1. ~~Drop the 7 visual tabular columns~~ — done (see Ablations).
 2. ~~Export versioned bundle + parity test~~ — done.
-3. **Slim serving reqs, arm64 Dockerfile, deploy to Oracle VM** — code done, validated locally; blocked on Oracle Ampere capacity.
-4. Move `videos.csv` → Postgres; containerize ingest/embed/finalize as CLI commands.
-5. Wrap in Airflow DAGs; add `backup`.
-6. Add `retrain` + promotion logic, then `monitor_drift`.
-7. **v2, early fusion:** cross-attention transformer over image patches + title tokens (30-50k+ rows). Local GPU or AWS spot — undecided. Adopt only if measurably better than v1.
+3. ~~Slim serving reqs, arm64 Dockerfile, validate Docker Compose stack locally~~ — done.
+4. **Deploy to Oracle VM** — code and Compose stack validated locally (amd64); blocked on Oracle Ampere capacity, arm64 not yet tested on real hardware.
+5. Move `videos.csv` → Postgres; containerize ingest/embed/finalize as CLI commands.
+6. Wrap in Airflow DAGs; add `backup`.
+7. Add `retrain` + promotion logic, then `monitor_drift`.
+8. **v2, early fusion:** cross-attention transformer over image patches + title tokens (30-50k+ rows). Local GPU or AWS spot — undecided. Adopt only if measurably better than v1.
 
 ### Open decisions
 - Retrain cadence, minimum new rows per cycle, test-slice length.
