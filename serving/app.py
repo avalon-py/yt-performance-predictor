@@ -21,7 +21,7 @@ from serving.bundle import LoadedBundle
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("serving")
 
-BUNDLE_PATH = os.environ.get("MODEL_BUNDLE_PATH", "models/bundles/latest_clip_b32.pt")
+BUNDLE_PATH = os.environ.get("MODEL_BUNDLE_PATH", "models/bundles/latest_clip_b32_clip.pt")
 
 _bundle_holder = {}
 

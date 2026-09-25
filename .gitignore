@@ -12,3 +12,4 @@ experiments/preds/
 models/bundles/
 *.key
 *.key.pub
+predict_api_caller.txt

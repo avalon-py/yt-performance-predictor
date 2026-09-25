@@ -25,7 +25,6 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from sentence_transformers import SentenceTransformer
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
@@ -203,6 +202,7 @@ def main():
     text_dim = None
 
     if want_minilm:
+        from sentence_transformers import SentenceTransformer
         print("Loading title encoder (MiniLM)...")
         text_encoder = SentenceTransformer(TEXT_MODEL_NAME)
         print("Embedding titles (MiniLM)...")
