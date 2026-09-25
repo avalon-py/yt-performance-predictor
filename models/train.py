@@ -40,7 +40,6 @@ EMBEDDINGS_DIR = os.path.join("data/embeddings", IMAGE_ENCODER)
 CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}{_suffix}.pt"
 RESULTS_PATH = "experiments/results.jsonl"
 CSV_PATH = "data/videos.csv"
-VISUAL_FEATURES_PATH = "data/visual_features.csv"
 PLOTS_DIR = "models/plots"
 BUNDLE_DIR = "models/bundles"
 
@@ -64,14 +63,6 @@ def load_data():
     df = pd.read_csv(CSV_PATH)
     df["label_finalized"] = df["label_finalized"].astype(str) == "True"
 
-    if not os.path.exists(VISUAL_FEATURES_PATH):
-        raise RuntimeError(
-            f"{VISUAL_FEATURES_PATH} not found -- run "
-            "`python -m models.precompute_visual_features` first."
-        )
-    visual = pd.read_csv(VISUAL_FEATURES_PATH)
-    df = df.merge(visual, on="video_id", how="left")
-
     image_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "image_embeddings.npy"))
     text_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, TEXT_FILES[TEXT_ENCODER]))
     valid_image_mask = np.load(os.path.join(EMBEDDINGS_DIR, "valid_image_mask.npy"))
@@ -84,11 +75,10 @@ def load_data():
         df["label_finalized"]
         & valid_image_mask[df["_embed_idx"].values]
         & df["trailing_avg_views"].notna()
-        & df["has_face"].notna()
     )
     print(f"Using {mask.sum()}/{len(df)} rows after filtering "
-          f"(finalized + valid image + has trailing_avg_views + has visual features)")
-
+        f"(finalized + valid image + has trailing_avg_views)")
+    
     df = df[mask].reset_index(drop=True)
     idxs = df["_embed_idx"].values
     image_embeddings = image_embeddings[idxs]
@@ -99,9 +89,6 @@ def load_data():
         df["clip_sim"] = cosine_rows(image_embeddings, clip_text)
         if "clip_sim" not in TABULAR_NUMERIC_COLS:
             TABULAR_NUMERIC_COLS.append("clip_sim")   # shared list, so build_tabular_matrix picks it up
-
-    df["has_face"] = df["has_face"].astype(str) == "True"
-    df["has_text_overlay"] = df["has_text_overlay"].astype(str) == "True"
 
     df["target"] = compute_target(df["views"], df["trailing_avg_views"])
 

@@ -58,8 +58,8 @@ YouTube Data API v3 ──► pipeline/run_ingestion.py ──► data/videos.cs
 |---|---|
 | Thumbnail image | Title length, word count, capitalized-word/letter counts and ratio, symbol count, has-question-mark, has-number |
 | Title (raw text) | Trailing average views (rolling, shifted), `is_first_video` |
-| Views, duration, publish date | Face count / has-face, text-overlay flag (MTCNN, EasyOCR) |
-| Subscriber count | Thumbnail color stats: mean saturation, brightness, brightness std, warm-hue ratio |
+| Views, duration, publish date | Face count / has-face, text-overlay flag (MTCNN, EasyOCR); *being removed, see Ablations* |
+| Subscriber count | Thumbnail color stats: mean saturation, brightness, brightness std, warm-hue ratio; *being removed, see Ablations* |
 | `categoryId` → genre | Optional `clip_sim`: cosine similarity between CLIP image and CLIP title embeddings |
 
 ## Model: v1 late fusion
@@ -68,7 +68,7 @@ Three branches, each with its own frozen pretrained encoder (where applicable), 
 
 - **Image branch:** default **CLIP ViT-B/32** (512-d, thumbnails squashed to 224x224). Alternatives selectable at embedding time: DINOv2 ViT-S/14 (384-d), CLIP ViT-B/16.
 - **Text branch:** default **CLIP text tower** on the title (512-d), same space as the CLIP image embedding. Alternative: `all-MiniLM-L6-v2` (384-d).
-- **Tabular branch:** log-scaled subscriber count and trailing average views, duration, title stats, face count, color stats, boolean flags (question mark, number, has-face, text overlay), one-hot genre, and optionally `clip_sim`.
+- **Tabular branch:** log-scaled subscriber count and trailing average views, duration, title stats, face count, color stats, boolean flags (question mark, number, has-face, text overlay), one-hot genre, and optionally `clip_sim`. (The face, text-overlay and color-stat features are being removed; see [Ablations](#ablations).)
 - **Fusion:** each branch → 32-d projection (ReLU + dropout) → concatenate → 64 → 16 → 1.
 - **Encoders are fully frozen.** Only projections and the head train. Embeddings are computed once and cached, since frozen encoders give identical outputs every epoch.
 
@@ -87,6 +87,29 @@ Mean ± std over seeds on the same 1,060-row test split (`experiments/results.js
 | MiniLM | off | 6 | 0.321 ± 0.012 | 0.641 | 0.484 |
 | MiniLM | on | 5 | 0.327 ± 0.003 | 0.643 | 0.486 |
 
+### Ablations
+
+**Modality ablation** (`models/ablation_modalities.py`, single seed, same test split; seed noise is about ±0.015 Spearman, so treat gaps as suggestive):
+
+| Variant | Test Spearman | Test AUC |
+|---|---|---|
+| tabular only (subs, trailing views, duration, genre) | 0.277 | 0.624 |
+| tabular + image | 0.302 | 0.630 |
+| tabular + text | 0.308 | 0.630 |
+| full fusion | 0.317 | 0.636 |
+
+Most of the skill comes from channel-level features. Thumbnail and title add roughly +0.04 Spearman together.
+
+**Visual tabular features** (`models/ablation_visual_flags.py`, 5 seeds, embeddings held fixed, only tabular columns removed):
+
+| Variant | Spearman (mean ± std) | AUC (mean ± std) | Paired Δ Spearman vs full |
+|---|---|---|---|
+| full | 0.339 ± 0.016 | 0.646 ± 0.012 | |
+| no face / text-overlay | 0.325 ± 0.018 | 0.631 ± 0.010 | −0.013 ± 0.030 |
+| no face / text-overlay / color stats | 0.346 ± 0.008 | 0.646 ± 0.004 | +0.007 ± 0.018 |
+
+No evidence that face, OCR or color-stat features help; the differences are within noise and non-monotonic. Decision: drop all seven visual tabular columns from training and serving (see Roadmap).
+
 All rows use the CLIP ViT-B/32 image encoder. Differences between these configurations are within seed-to-seed noise, so there is no evidence yet that one text encoder or the similarity feature is better. The signal is real but modest. `models/baseline.py` and `models/inspect_target_and_baseline.py` compare against naive, linear, Ridge and LightGBM baselines on the identical split; run them to see how much of the score comes from the image and text branches rather than from `trailing_avg_views` alone.
 
 ## Known limitations (tracked, not hidden)
@@ -95,7 +118,7 @@ All rows use the CLIP ViT-B/32 image encoder. Differences between these configur
 - **Label timing is not a fixed horizon.** Today `label_finalized` flips once a video is ≥28 days old *at the time of an ingestion run*, and views are whatever the API returns at that moment. For backfilled videos that can be many months, not day 28. The planned redesign ingests right after publish and reads views once at day 28.
 - **Trailing baseline in incremental runs (found in code review, verify before relying on it).** `compute_trailing_views` runs over only the videos fetched in the current run, and already-finalized videos are excluded from that fetch. On re-runs, the baseline for newly fetched videos may therefore be computed from a truncated history. Computing it from the full per-channel history (e.g. in Postgres) is part of the redesign.
 - **`is_first_video`** means the first video in our fetched 2025+ window for that channel, not the channel's first upload ever.
-- **Visual features are heavy and their value is unmeasured in the committed results.** MTCNN and EasyOCR dominate the size of any serving image. `models/ablation_modalities.py` is meant to test their contribution; results are not committed.
+- **Visual tabular features are heavy and showed no measurable benefit.** MTCNN and EasyOCR dominate the size and dependency risk of any serving image, and the 5-seed ablation above found no gain from face, text-overlay or color-stat features. They are being removed from training and serving. The code (`features/visual_features.py`, `models/precompute_visual_features.py`) stays in the repo for experiments, and `load_data()` in `models/train.py` still requires `data/visual_features.csv` until that change lands.
 - **Checkpoint format is not serving-ready.** `train.py` saves weights plus a pickled sklearn scaler tuple, but not the feature column order (implied by module-level lists in `models/dataset.py`, one of which `load_data()` mutates when `USE_SIM=1`). Serving needs a versioned bundle (weights, scalers, column order, encoder names) and a parity test against the training path.
 - **Delayed labels:** rows are only used for training when `label_finalized` is true, and finalized rows are never re-fetched.
 - Ingestion re-runs are idempotent and incremental: thumbnails are skipped if already downloaded, and finalized `video_id`s are excluded from the `videos.list` fetch.
@@ -120,7 +143,7 @@ All rows use the CLIP ViT-B/32 image encoder. Differences between these configur
 | DAG | When | Does |
 |---|---|---|
 | `ingest_new` | daily | videos not in DB yet: thumbnail, title, channel snapshot (subs, baseline) at ingest time |
-| `embed_new` | after ingest | encoder embeddings and visual features for rows missing them (idempotent) |
+| `embed_new` | after ingest | CLIP image and text embeddings for rows missing them (idempotent) |
 | `finalize_labels` | daily | read views at ~28 days, set `label_finalized`, never rewrite |
 | `retrain` | periodic or on drift | build dataset, train challenger, gate, compare, promote or reject |
 | `monitor_drift` | weekly | error on newly finalized videos plus feature shift; can trigger `retrain` |
@@ -150,16 +173,17 @@ Airflow UI behind auth. Postgres never public. Secrets in `.env`, not in images.
 
 ## Roadmap
 
-1. Export a versioned model bundle from `train.py` and add a train/serve parity test.
-2. Slim serving requirements and an arm64 Dockerfile; deploy Caddy + FastAPI to the Oracle VM.
-3. Move `videos.csv` into Postgres; turn ingest, embed and finalize into containerized CLI commands.
-4. Wrap those commands in Airflow DAGs; add `backup`.
-5. Add `retrain` with the promotion logic above, then `monitor_drift`.
-6. **v2, early fusion:** cross-attention transformer over image patch tokens and title tokens jointly, to capture thumbnail/title mismatch signals late fusion can't see. To be compared against v1 on the same data; adopted only if measurably better.
+1. Remove the seven visual tabular columns from `models/dataset.py`, make the visual-features merge/filter in `load_data()` optional, and retrain on the same rows to confirm the baseline.
+2. Export a versioned model bundle from `train.py` and add a train/serve parity test.
+3. Slim serving requirements and an arm64 Dockerfile; deploy Caddy + FastAPI to the Oracle VM.
+4. Move `videos.csv` into Postgres; turn ingest, embed and finalize into containerized CLI commands.
+5. Wrap those commands in Airflow DAGs; add `backup`.
+6. Add `retrain` with the promotion logic above, then `monitor_drift`.
+7. **v2, early fusion:** cross-attention transformer over image patch tokens and title tokens jointly, to capture thumbnail/title mismatch signals late fusion can't see. To be compared against v1 on the same data; adopted only if measurably better.
 
 ### Open decisions
 
-- Face/OCR features at serving (MTCNN + EasyOCR are heavy): keep, replace with lighter versions, or drop, based on the ablation.
+- ~~Face/OCR features at serving~~ Decided: drop, based on the ablation above.
 - Serve CLIP only (image + text towers) and drop MiniLM/DINOv2 from the serving image, since the encoder differences above are within noise.
 - Retrain cadence, minimum new rows, and test-slice length.
 - Rejection rule: strictly "CI below 0", or with a small margin.
@@ -180,6 +204,7 @@ models/
   baseline.py                     naive / linear / fusion comparison
   inspect_target_and_baseline.py  target diagnostics, Ridge / LightGBM comparison
   ablation_modalities.py          tabular / text / image / full-fusion ablation
+  ablation_visual_flags.py        multi-seed test of face / OCR / color tabular features
 experiments/   results.jsonl (one line per training run)
 data/          local dataset output (gitignored: images/, videos.csv, embeddings/, ...)
 current_EDA.ipynb
@@ -212,14 +237,11 @@ python -m models.precompute_embeddings
 #    other options: --image-encoder dinov2|clip_b16, --text-encoder minilm|clip|both,
 #                   --image-mode squash|crop, --limit N (smoke test)
 
-# 4. Precompute visual features (has_face, text overlay, color stats)
-python -m models.precompute_visual_features
-
-# 5. Train (env vars: IMAGE_ENCODER, TEXT_ENCODER, USE_SIM, SEED)
+# 4. Train (env vars: IMAGE_ENCODER, TEXT_ENCODER, USE_SIM, SEED)
 python -m models.train
 IMAGE_ENCODER=clip_b32 TEXT_ENCODER=minilm USE_SIM=1 SEED=3 python -m models.train
 
-# 6. Baselines, diagnostics and ablations
+# 5. Baselines, diagnostics and ablations
 python -m models.baseline
 python -m models.inspect_target_and_baseline
 python -m models.ablation_modalities
