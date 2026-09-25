@@ -11,12 +11,14 @@ late_fusion_model.py -- run that first if anything errors here.
 """
 
 import os
+import hashlib
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from scipy.stats import spearmanr
 from collections import deque
+from datetime import datetime, timezone
 import matplotlib.pyplot as plt
 import json
 import random
@@ -39,6 +41,7 @@ CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}{_suffix}.p
 RESULTS_PATH = "experiments/results.jsonl"
 CSV_PATH = "data/videos.csv"
 PLOTS_DIR = "models/plots"
+BUNDLE_DIR = "models/bundles"
 
 BATCH_SIZE = 64
 EPOCHS = 200
@@ -192,6 +195,84 @@ def plot_training_curves(train_losses, val_losses, val_spearmans, smoothed_spear
     plt.close(fig)
 
     print(f"\nSaved training curves to {loss_path} and {spearman_path}")
+
+def export_bundle(*, checkpoint, df, train_idx, test_metrics):
+    """Package everything serving needs into one versioned, self-describing
+    file: weights, fitted scalers, genre categories, the EXACT tabular column
+    order/composition used for this run (TABULAR_NUMERIC_COLS may have had
+    'clip_sim' appended by load_data() before we get here -- snapshot it now,
+    not the static module list), which encoders produced the cached
+    embeddings and how the image was preprocessed (from precompute_embeddings'
+    meta.json, since serving has to reproduce that transform exactly), the
+    last training-row timestamp (train_end, for the retrain/promotion gate),
+    and this run's metrics. Also copies to bundles/latest_<name>.pt for local
+    convenience; the model registry (Postgres) takes over "current champion"
+    once that exists.
+
+    Not run in this environment (no torch here) -- reviewed by hand against
+    build_tabular_matrix()'s concatenation order in models/dataset.py.
+    """
+    meta_path = os.path.join(EMBEDDINGS_DIR, "meta.json")
+    with open(meta_path) as f:
+        embed_meta = json.load(f)
+
+    train_end = df.iloc[train_idx]["published_at"].max()
+    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    bundle = {
+        "bundle_format_version": 1,
+        "version": version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "train_end": str(train_end),
+
+        "model_state_dict": checkpoint["model_state_dict"],
+        "image_dim": checkpoint["image_dim"],
+        "text_dim": checkpoint["text_dim"],
+        "tabular_dim": checkpoint["tabular_dim"],
+
+        "scaler": checkpoint["scaler"],
+        "genre_categories": checkpoint["genre_categories"],
+        # Snapshot, not a reference to the shared module list: it may include
+        # "clip_sim" appended at runtime by load_data(). This dict is the
+        # single source of truth for column order at serving time.
+        "feature_columns": {
+            "log_cols": list(TABULAR_LOG_COLS),
+            "numeric_cols": list(TABULAR_NUMERIC_COLS),
+            "bool_cols": list(TABULAR_BOOL_COLS),
+        },
+
+        "image_encoder": checkpoint["image_encoder"],
+        "text_encoder": checkpoint["text_encoder"],
+        "use_sim": checkpoint["use_sim"],
+        "image_mode": embed_meta["image_mode"],
+        "clip_text_model": embed_meta.get("clip_text_model"),
+
+        "metrics": {
+            "best_epoch": checkpoint["epoch"],
+            "val_loss": checkpoint["val_loss"],
+            "val_spearman_raw": checkpoint["val_spearman_raw"],
+            "val_spearman_smoothed": checkpoint["val_spearman_smoothed"],
+            **test_metrics,
+        },
+    }
+
+    os.makedirs(BUNDLE_DIR, exist_ok=True)
+    versioned_path = os.path.join(BUNDLE_DIR, f"{IMAGE_ENCODER}{_suffix}_{version}.pt")
+    torch.save(bundle, versioned_path)
+
+    latest_path = os.path.join(BUNDLE_DIR, f"latest_{IMAGE_ENCODER}{_suffix}.pt")
+    torch.save(bundle, latest_path)
+
+    # sha256 of the versioned file, so a deploy can confirm it copied the
+    # bundle it thinks it copied
+    with open(versioned_path, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+
+    print(f"\nSaved model bundle: {versioned_path}")
+    print(f"Also updated:       {latest_path}")
+    print(f"sha256: {digest}")
+    return versioned_path
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -365,6 +446,22 @@ def main():
     os.makedirs("experiments/preds", exist_ok=True)
     np.savez(f"experiments/preds/{IMAGE_ENCODER}_{TEXT_ENCODER}_sim{int(USE_SIM)}_s{SEED}.npz",
              video_id=test_sub["video_id"].values, pred=preds, target=targets)
+
+    export_bundle(
+        checkpoint=checkpoint,
+        df=df,
+        train_idx=train_idx,
+        test_metrics={
+            "test_loss": float(test_loss),
+            "test_spearman": float(spearman_corr),
+            "test_auc": float(auc),
+            "test_mae_target": float(mae_target_scale),
+            "test_mae_views": float(mae_views),
+            "test_rmse_views": float(rmse_views),
+            "test_mape_views": float(mape_views),
+            "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx),
+        },
+    )
 
 
 if __name__ == "__main__":
