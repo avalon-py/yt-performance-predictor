@@ -1,6 +1,6 @@
 # linux/arm64 target (Oracle Ampere A1). Build with:
 #   docker buildx build --platform linux/arm64 -t yt-performance-predictor:latest .
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -12,6 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements-serve.txt .
+
+RUN pip install --no-cache-dir torch==2.11.0 torchvision==0.26.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+
 RUN pip install --no-cache-dir -r requirements-serve.txt
 
 # Only what serving/ actually needs at import time -- no data/, notebooks,
@@ -22,7 +26,7 @@ COPY features/ features/
 
 # Bundle is NOT baked into the image (retrains shouldn't require a rebuild) --
 # it's mounted as a volume at runtime, see docker-compose.yml.
-ENV MODEL_BUNDLE_PATH=/app/models/bundles/latest_clip_b32.pt
+ENV MODEL_BUNDLE_PATH=/app/models/bundles/latest_clip_b32_clip.pt
 
 EXPOSE 8000
 CMD ["uvicorn", "serving.app:app", "--host", "0.0.0.0", "--port", "8000"]
