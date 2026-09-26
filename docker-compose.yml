@@ -2,6 +2,12 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: Dockerfile.airflow
+  # Without this, Compose names the built image per-service (airflow-init,
+  # airflow-api-server, airflow-scheduler, airflow-dag-processor each get
+  # their own ~2.6GB copy of the identical image) even though they all share
+  # this same build config. Naming it here means one build, one image, reused
+  # by all four services.
+  image: ytpp-airflow:latest
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
@@ -22,8 +28,13 @@ x-airflow-common: &airflow-common
     # JWT issued by one is accepted by the others. Sharing this anchor block
     # already guarantees that -- just needs a fixed value instead of Airflow
     # generating a fresh one per-process.
-    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-ytpp_dev_jwt_secret_change_me}
     AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    # Read by dags/train_model.py at parse time to build bind-mount sources
+    # for DockerOperator -- must be the path to this repo as the *Docker
+    # daemon* sees it (reached via /var/run/docker.sock below), not the path
+    # inside this scheduler/dag-processor container.
+    HOST_PROJECT_DIR: ${HOST_PROJECT_DIR}
     # Passed through so dags/*.py can read them at parse time and hand them
     # to DockerOperator's `environment=` for the worker containers. See the
     # "known simplification" note in dags/ingest_new.py re: Connections/secrets

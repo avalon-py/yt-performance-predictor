@@ -173,14 +173,7 @@ docker compose exec airflow-scheduler airflow dags list-import-errors
 # 7. Trigger ingest_new (calls the real YouTube API -- costs real quota)
 docker compose exec airflow-scheduler airflow dags test ingest_new 2026-01-01
 
-# 8. Check to unpause embed_new (embed_new may be paused sometimes)
-#   Check if embed_new is paused
-docker compose exec airflow-scheduler airflow dags list | Select-String "embed_new" # If is_paused is True, then unpause:
-#   Unpause the embedding process
-docker compose exec airflow-scheduler airflow dags unpause embed_new
-docker compose exec airflow-scheduler airflow dags trigger embed_new
-
-# 9. Final checks
+# 8. Final checks
 #   Check for MinIO content (images)
 docker run --rm --network ytpp_net `                  
 >>   -e POSTGRES_HOST=postgres -e POSTGRES_PORT=5432 `
