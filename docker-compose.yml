@@ -1,3 +1,63 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  # Without this, Compose names the built image per-service (airflow-init,
+  # airflow-api-server, airflow-scheduler, airflow-dag-processor each get
+  # their own ~2.6GB copy of the identical image) even though they all share
+  # this same build config. Naming it here means one build, one image, reused
+  # by all four services.
+  image: ytpp-airflow:latest
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    # NOTE: Airflow 3's default auth manager (simple/FAB) setup differs from
+    # 2.x -- confirm exact envs / first-run admin-password location against
+    # your installed 3.3.1 docs before relying on this; not re-derived here.
+    # Airflow 3's Task Execution API (AIP-72): the scheduler's task subprocess
+    # calls back to the api-server over HTTP to report task state instead of
+    # talking to the metadata DB directly. Without this URL it defaults to
+    # localhost:8080/execution/, which inside the scheduler container is
+    # itself -- nothing listens there -- causing Connection refused.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-api-server:8080/execution/"
+    # Must be identical across api-server, scheduler and dag-processor so a
+    # JWT issued by one is accepted by the others. Sharing this anchor block
+    # already guarantees that -- just needs a fixed value instead of Airflow
+    # generating a fresh one per-process.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-ytpp_dev_jwt_secret_change_me}
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    # Read by dags/train_model.py at parse time to build bind-mount sources
+    # for DockerOperator -- must be the path to this repo as the *Docker
+    # daemon* sees it (reached via /var/run/docker.sock below), not the path
+    # inside this scheduler/dag-processor container.
+    HOST_PROJECT_DIR: ${HOST_PROJECT_DIR}
+    # Passed through so dags/*.py can read them at parse time and hand them
+    # to DockerOperator's `environment=` for the worker containers. See the
+    # "known simplification" note in dags/ingest_new.py re: Connections/secrets
+    # backend for anything beyond single-user local/VM use.
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB: ${POSTGRES_DB}
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - airflow_logs:/opt/airflow/logs
+    # Lets DockerOperator (running LocalExecutor tasks in-process) launch
+    # sibling ytpp-worker containers on the host's own Docker daemon.
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - ytpp_net
+
 services:
   api:
     build:
@@ -25,6 +85,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    networks:
+      - ytpp_net
 
   caddy:
     image: caddy:2-alpine
@@ -38,6 +100,8 @@ services:
       - caddy_config:/config
     depends_on:
       - api
+    networks:
+      - ytpp_net
 
   postgres:
     image: pgvector/pgvector:pg16
@@ -56,6 +120,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - ytpp_net
 
   minio:
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
@@ -74,9 +140,75 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - ytpp_net
+
+  # Image used by Airflow's DockerOperator tasks (ingest_new, embed_new).
+  # No CMD in Dockerfile.worker, so this must NOT run as a live service --
+  # it's behind a profile so `docker compose up` skips it; build explicitly:
+  #   docker compose build worker
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: ytpp-worker:latest
+    profiles: ["build-only"]
+    networks:
+      - ytpp_net
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+networks:
+  ytpp_net:
+    name: ytpp_net
 
 volumes:
   caddy_data:
   caddy_config:
   postgres_data:
   minio_data:
+  airflow_logs:

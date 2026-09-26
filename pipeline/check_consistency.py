@@ -16,9 +16,11 @@ load_dotenv()
 
 from sqlalchemy import create_engine
 
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
 DB_URL = (
     f"postgresql+psycopg2://{os.environ['POSTGRES_USER']}:"
-    f"{os.environ['POSTGRES_PASSWORD']}@localhost:5432/{os.environ['POSTGRES_DB']}"
+    f"{os.environ['POSTGRES_PASSWORD']}@{POSTGRES_HOST}:{POSTGRES_PORT}/{os.environ['POSTGRES_DB']}"
 )
 engine = create_engine(DB_URL)
 
