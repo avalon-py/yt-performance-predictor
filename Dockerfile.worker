@@ -1,0 +1,24 @@
+FROM python:3.13-slim
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libjpeg62-turbo zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-train.txt .
+RUN pip install --no-cache-dir torch==2.11.0 torchvision==0.26.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir -r requirements-train.txt
+
+COPY ingestion/ ingestion/
+COPY pipeline/ pipeline/
+COPY models/ models/
+COPY features/ features/
+
+RUN python -c "from transformers import CLIPModel, AutoTokenizer; \
+CLIPModel.from_pretrained('openai/clip-vit-base-patch32'); \
+AutoTokenizer.from_pretrained('openai/clip-vit-base-patch32')"
+
+ENV PYTHONUNBUFFERED=1
+ENV HF_HUB_OFFLINE=1
+# No CMD -- DockerOperator supplies the module per task.

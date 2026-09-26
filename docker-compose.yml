@@ -1,3 +1,40 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # NOTE: Airflow 3's default auth manager (simple/FAB) setup differs from
+    # 2.x -- confirm exact envs / first-run admin-password location against
+    # your installed 3.3.1 docs before relying on this; not re-derived here.
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    # Passed through so dags/*.py can read them at parse time and hand them
+    # to DockerOperator's `environment=` for the worker containers. See the
+    # "known simplification" note in dags/ingest_new.py re: Connections/secrets
+    # backend for anything beyond single-user local/VM use.
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB: ${POSTGRES_DB}
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - airflow_logs:/opt/airflow/logs
+    # Lets DockerOperator (running LocalExecutor tasks in-process) launch
+    # sibling ytpp-worker containers on the host's own Docker daemon.
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - ytpp_net
+
 services:
   api:
     build:
@@ -25,6 +62,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    networks:
+      - ytpp_net
 
   caddy:
     image: caddy:2-alpine
@@ -38,6 +77,8 @@ services:
       - caddy_config:/config
     depends_on:
       - api
+    networks:
+      - ytpp_net
 
   postgres:
     image: pgvector/pgvector:pg16
@@ -56,6 +97,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - ytpp_net
 
   minio:
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
@@ -74,9 +117,80 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - ytpp_net
+
+  # Image used by Airflow's DockerOperator tasks (ingest_new, embed_new).
+  # No CMD in Dockerfile.worker, so this must NOT run as a live service --
+  # it's behind a profile so `docker compose up` skips it; build explicitly:
+  #   docker compose build worker
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: ytpp-worker:latest
+    profiles: ["build-only"]
+    networks:
+      - ytpp_net
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+networks:
+  ytpp_net:
+    name: ytpp_net
 
 volumes:
   caddy_data:
   caddy_config:
   postgres_data:
   minio_data:
+  airflow_logs:
