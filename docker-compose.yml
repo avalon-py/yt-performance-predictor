@@ -12,6 +12,17 @@ x-airflow-common: &airflow-common
     # NOTE: Airflow 3's default auth manager (simple/FAB) setup differs from
     # 2.x -- confirm exact envs / first-run admin-password location against
     # your installed 3.3.1 docs before relying on this; not re-derived here.
+    # Airflow 3's Task Execution API (AIP-72): the scheduler's task subprocess
+    # calls back to the api-server over HTTP to report task state instead of
+    # talking to the metadata DB directly. Without this URL it defaults to
+    # localhost:8080/execution/, which inside the scheduler container is
+    # itself -- nothing listens there -- causing Connection refused.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-api-server:8080/execution/"
+    # Must be identical across api-server, scheduler and dag-processor so a
+    # JWT issued by one is accepted by the others. Sharing this anchor block
+    # already guarantees that -- just needs a fixed value instead of Airflow
+    # generating a fresh one per-process.
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
     AIRFLOW_UID: ${AIRFLOW_UID:-50000}
     # Passed through so dags/*.py can read them at parse time and hand them
     # to DockerOperator's `environment=` for the worker containers. See the
