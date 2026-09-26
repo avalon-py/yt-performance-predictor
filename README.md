@@ -102,7 +102,7 @@ This is how the app actually runs, both locally and on the eventual Oracle VM: F
 
 ```bash
 docker compose up -d --build
-docker compose ps          # api should show "healthy" after ~30s
+docker compose ps
 ```
 
 Copy `.env.example` to `.env` and fill in `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` and `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` first — `docker-compose.yml` reads these for the `postgres` and `minio` services (and passes them through to `api`, even though `api` doesn't currently use them — see the open item above).
@@ -134,6 +134,80 @@ curl -X POST http://localhost:8000/predict \
 Unlike Compose, `-p 8000:8000` here does publish the port to the host directly, so plain `curl http://localhost:8000/...` works — but there's no Caddy/HTTPS in front of it, so this isn't representative of the deployed setup.
 
 `requirements-serve.txt` is meant to be hand-curated and exactly pinned (not a `pip freeze`) to only what `serving/` imports — see the open item above, since it currently isn't quite that. torch/torchvision install from PyTorch's CPU-only wheel index in the Dockerfile (a plain install resolves to CUDA wheels the Ampere VM, no GPU, doesn't need).
+
+### Running it — Airflow
+
+Prereqs: `.env` filled in (see `.env.example` — now includes `AIRFLOW_UID`,
+`_AIRFLOW_WWW_USER_USERNAME`/`PASSWORD` (currently unused, see note below),
+`AIRFLOW_FERNET_KEY`), `docker compose up -d postgres minio` already healthy.
+
+```bash
+# 1. Build the worker image (every ingest_new/embed_new task runs inside this)
+docker compose build worker
+
+# 2. Confirm the `airflow` database exists in Postgres.
+#    db/init/000_create_airflow_db.sh only runs on a FRESH postgres_data volume --
+#    if postgres was already running before this file existed, create it by hand:
+docker compose exec postgres psql -U $POSTGRES_USER -l   # look for "airflow" in the list
+# if missing:
+docker compose exec postgres psql -U $POSTGRES_USER -c "CREATE DATABASE airflow;"
+
+# 3. Initialize Airflow's metadata DB (migration only -- no `users create`,
+#    that's a FAB-only command and Airflow 3 defaults to SimpleAuthManager)
+docker compose run --rm airflow-init
+
+# 4. Start the Airflow services
+docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor
+docker compose ps   # all three should reach healthy/running
+
+# 5. Get the admin login -- SimpleAuthManager auto-generates it on first
+#    boot and prints it once to the api-server's logs
+docker compose logs airflow-api-server | grep password
+# (PowerShell: docker compose logs airflow-api-server | Select-String -Pattern "password")
+# UI: http://localhost:8080, username "admin", password from that line
+
+# 6. Confirm both DAGs parsed with no import errors
+docker compose exec airflow-scheduler airflow dags list
+docker compose exec airflow-scheduler airflow dags list-import-errors
+
+# 7. Trigger ingest_new (calls the real YouTube API -- costs real quota)
+docker compose exec airflow-scheduler airflow dags test ingest_new 2026-01-01
+
+# 8. Check to unpause embed_new (embed_new may be paused sometimes)
+#   Check if embed_new is paused
+docker compose exec airflow-scheduler airflow dags list | Select-String "embed_new" # If is_paused is True, then unpause:
+#   Unpause the embedding process
+docker compose exec airflow-scheduler airflow dags unpause embed_new
+docker compose exec airflow-scheduler airflow dags trigger embed_new
+
+# 9. Final checks
+#   Check for MinIO content (images)
+docker run --rm --network ytpp_net `                  
+>>   -e POSTGRES_HOST=postgres -e POSTGRES_PORT=5432 `
+>>   -e POSTGRES_USER=ytpp -e POSTGRES_PASSWORD=ytpp_2026_proj -e POSTGRES_DB=ytpp `
+>>   -e MINIO_ENDPOINT=minio:9000 -e MINIO_ROOT_USER=ytpp -e MINIO_ROOT_PASSWORD=ytpp_2026_proj `
+>>   ytpp-worker:latest python -m pipeline.check_consistency
+#   Check for PostgreSQL content (images)
+docker compose exec postgres psql -U ytpp -d ytpp -c "SELECT count(*), count(image_embedding), count(text_embedding) FROM videos;"
+# Make sure that all numbers of rows match.
+
+```
+
+**Known gaps / simplifications, not yet resolved:**
+- Auth is SimpleAuthManager (dev-only, plaintext password file at
+  `/opt/airflow/simple_auth_manager_passwords.json.generated` inside the
+  container) — fine for local/solo use, not for anything exposed beyond
+  your own machine. `_AIRFLOW_WWW_USER_USERNAME`/`PASSWORD` in `.env.example`
+  are currently dead config, left over from the FAB-style setup this
+  replaced.
+- DB/MinIO credentials for worker tasks are read from the Airflow
+  container's own env (passed through from `.env`), not from Airflow
+  Connections/a secrets backend. Fine for one person on one VM, not
+  beyond that.
+- `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS` must be set (e.g.
+  `"admin:admin"`) or no user gets created at all — SimpleAuthManager does
+  **not** auto-create an `admin` user out of the box the way older Airflow
+  versions did.
 
 ## Deployment (planned infra)
 

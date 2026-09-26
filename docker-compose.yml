@@ -8,6 +8,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
     # NOTE: Airflow 3's default auth manager (simple/FAB) setup differs from
     # 2.x -- confirm exact envs / first-run admin-password location against
     # your installed 3.3.1 docs before relying on this; not re-derived here.
@@ -140,11 +141,6 @@ services:
       - -c
       - |
         airflow db migrate
-        airflow users create \
-          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
-          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
-          --firstname Admin --lastname User \
-          --role Admin --email admin@example.com || true
 
   airflow-api-server:
     <<: *airflow-common
