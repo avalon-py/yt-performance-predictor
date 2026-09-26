@@ -23,23 +23,31 @@ import matplotlib.pyplot as plt
 import json
 import random
 
-
 from features.target import compute_target, invert_target
 from models.dataset import VideoDataset, build_tabular_matrix, TABULAR_LOG_COLS, TABULAR_NUMERIC_COLS, TABULAR_BOOL_COLS
 from models.late_fusion_model import LateFusionModel
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, roc_auc_score
 
-IMAGE_ENCODER = os.environ.get("IMAGE_ENCODER", "clip_b32") # Option: dinov2 | clip_b32
-TEXT_ENCODER = os.environ.get("TEXT_ENCODER", "clip") # Option: minilm | clip
-USE_SIM = os.environ.get("USE_SIM", "0") == "1"
-TEXT_FILES = {"minilm": "text_embeddings.npy", "clip": "clip_text_embeddings.npy"}
+from dotenv import load_dotenv
+load_dotenv()
+from sqlalchemy import create_engine
 
-_suffix = ("" if TEXT_ENCODER == "minilm" else f"_{TEXT_ENCODER}") + ("_sim" if USE_SIM else "")
+DB_URL = (
+    f"postgresql+psycopg2://{os.environ['POSTGRES_USER']}:"
+    f"{os.environ['POSTGRES_PASSWORD']}@localhost:5432/{os.environ['POSTGRES_DB']}"
+)
+engine = create_engine(DB_URL)
+
+IMAGE_ENCODER = "clip_b32"   # fixed -- no more dinov2/clip_b16 switch
+TEXT_ENCODER = "clip"        # fixed -- no more minilm switch
+IMAGE_MODE = "squash"        # matches precompute_embeddings.py's hardcoded transform
+CLIP_TEXT_MODEL = "openai/clip-vit-base-patch32"
+USE_SIM = os.environ.get("USE_SIM", "0") == "1"
+
+_suffix = "_sim" if USE_SIM else ""
 SEED = int(os.environ.get("SEED", 42))
-EMBEDDINGS_DIR = os.path.join("data/embeddings", IMAGE_ENCODER)
 CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}{_suffix}.pt"
 RESULTS_PATH = "experiments/results.jsonl"
-CSV_PATH = "data/videos.csv"
 PLOTS_DIR = "models/plots"
 BUNDLE_DIR = "models/bundles"
 
@@ -59,43 +67,42 @@ def cosine_rows(a, b):
     b = b / np.maximum(np.linalg.norm(b, axis=1, keepdims=True), 1e-8)
     return (a * b).sum(axis=1)
 
+def parse_vector(s):
+    """Postgres/pgvector returns 'vector' columns as their bracketed text
+    form, e.g. '[0.1,0.2,...]', since no pgvector adapter is registered."""
+    return np.fromstring(s.strip("[]"), sep=",", dtype=np.float32)
+
+
 def load_data():
-    df = pd.read_csv(CSV_PATH)
-    df["label_finalized"] = df["label_finalized"].astype(str) == "True"
+    query = """
+        SELECT video_id, title, published_at, views, subscriber_count_at_upload,
+               genre, duration_seconds, title_length_chars, title_word_count,
+               title_capitalized_word_count, title_capitalized_letter_count,
+               title_capitalized_letter_ratio, title_symbol_count,
+               title_has_question_mark, title_has_number, trailing_avg_views,
+               is_first_video, image_embedding, text_embedding
+        FROM videos
+        WHERE label_finalized = true
+          AND image_embedding IS NOT NULL
+          AND trailing_avg_views IS NOT NULL
+    """
+    df = pd.read_sql(query, engine)
+    print(f"Loaded {len(df)} rows from Postgres after filtering "
+          f"(finalized + valid image + has trailing_avg_views)")
 
-    image_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, "image_embeddings.npy"))
-    text_embeddings = np.load(os.path.join(EMBEDDINGS_DIR, TEXT_FILES[TEXT_ENCODER]))
-    valid_image_mask = np.load(os.path.join(EMBEDDINGS_DIR, "valid_image_mask.npy"))
-    video_id_order = pd.read_csv(os.path.join(EMBEDDINGS_DIR, "video_id_order.csv"))
+    image_embeddings = np.stack(df["image_embedding"].apply(parse_vector).values)
+    text_embeddings = np.stack(df["text_embedding"].apply(parse_vector).values)
+    df = df.drop(columns=["image_embedding", "text_embedding"]).reset_index(drop=True)
 
-    df = df.merge(video_id_order.reset_index().rename(columns={"index": "_embed_idx"}), on="video_id")
-    df = df.sort_values("_embed_idx").reset_index(drop=True)
-
-    mask = (
-        df["label_finalized"]
-        & valid_image_mask[df["_embed_idx"].values]
-        & df["trailing_avg_views"].notna()
-    )
-    print(f"Using {mask.sum()}/{len(df)} rows after filtering "
-        f"(finalized + valid image + has trailing_avg_views)")
-    
-    df = df[mask].reset_index(drop=True)
-    idxs = df["_embed_idx"].values
-    image_embeddings = image_embeddings[idxs]
-    text_embeddings = text_embeddings[idxs]
     if USE_SIM:
-        assert IMAGE_ENCODER.startswith("clip"), "similarity needs CLIP image + CLIP text (shared space)"
-        clip_text = np.load(os.path.join(EMBEDDINGS_DIR, "clip_text_embeddings.npy"))[idxs]
-        df["clip_sim"] = cosine_rows(image_embeddings, clip_text)
+        df["clip_sim"] = cosine_rows(image_embeddings, text_embeddings)
         if "clip_sim" not in TABULAR_NUMERIC_COLS:
-            TABULAR_NUMERIC_COLS.append("clip_sim")   # shared list, so build_tabular_matrix picks it up
+            TABULAR_NUMERIC_COLS.append("clip_sim")
 
     df["target"] = compute_target(df["views"], df["trailing_avg_views"])
-
-    df.to_csv("data/full_dataset.csv")
+    df.to_csv("data/full_dataset.csv")  # inspection artifact, unchanged
 
     return df, image_embeddings, text_embeddings
-
 
 def time_based_split(df):
     sorted_idx = df.sort_values("published_at").index
@@ -212,9 +219,6 @@ def export_bundle(*, checkpoint, df, train_idx, test_metrics):
     Not run in this environment (no torch here) -- reviewed by hand against
     build_tabular_matrix()'s concatenation order in models/dataset.py.
     """
-    meta_path = os.path.join(EMBEDDINGS_DIR, "meta.json")
-    with open(meta_path) as f:
-        embed_meta = json.load(f)
 
     train_end = df.iloc[train_idx]["published_at"].max()
     version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -244,9 +248,9 @@ def export_bundle(*, checkpoint, df, train_idx, test_metrics):
         "image_encoder": checkpoint["image_encoder"],
         "text_encoder": checkpoint["text_encoder"],
         "use_sim": checkpoint["use_sim"],
-        "image_mode": embed_meta["image_mode"],
-        "clip_text_model": embed_meta.get("clip_text_model"),
-
+        "image_mode": IMAGE_MODE,
+        "clip_text_model": CLIP_TEXT_MODEL,
+        
         "metrics": {
             "best_epoch": checkpoint["epoch"],
             "val_loss": checkpoint["val_loss"],
