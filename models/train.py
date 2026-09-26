@@ -44,7 +44,7 @@ IMAGE_MODE = "squash"        # matches precompute_embeddings.py's hardcoded tran
 CLIP_TEXT_MODEL = "openai/clip-vit-base-patch32"
 USE_SIM = os.environ.get("USE_SIM", "0") == "1"
 
-_suffix = "_sim" if USE_SIM else ""
+_suffix = "_clip_sim" if USE_SIM else "_clip"
 SEED = int(os.environ.get("SEED", 42))
 CHECKPOINT_PATH = f"models/checkpoints/late_fusion_v1_{IMAGE_ENCODER}{_suffix}.pt"
 RESULTS_PATH = "experiments/results.jsonl"

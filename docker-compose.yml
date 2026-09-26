@@ -10,6 +10,14 @@ services:
       - MODEL_BUNDLE_PATH=/app/models/bundles/latest_clip_b32_clip.pt
       - HF_HUB_DISABLE_XET=1
       - PYTHONUNBUFFERED=1
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
     ports:
       - "8000:8000"
     depends_on:
@@ -17,11 +25,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
   caddy:
     image: caddy:2-alpine
