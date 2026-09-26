@@ -23,19 +23,31 @@ from ingestion.tubecensus_client import get_subscriber_count_at
 from features.title_features import parse_duration_iso8601_to_seconds, title_features
 from features.trailing_views import compute_trailing_views
 
+import boto3
+from botocore.config import Config
+
+from ingestion.thumbnail_downloader import download_thumbnail, ensure_bucket_exists
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "channels.json")
 PUBLISHED_AFTER = "2025-01-01T00:00:00Z"
 LABEL_MATURITY_DAYS = 28
 SHORTS_MAX_DURATION_SECONDS = 180
 OUTPUT_DIR = "data"
-IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")  # still local for now -- MinIO migration is a separate step
 
 DB_URL = (
     f"postgresql+psycopg2://{os.environ['POSTGRES_USER']}:"
     f"{os.environ['POSTGRES_PASSWORD']}@localhost:5432/{os.environ['POSTGRES_DB']}"
 )
 engine = create_engine(DB_URL)
+
+minio_client = boto3.client(
+    "s3",
+    endpoint_url=f"http://{os.environ['MINIO_ENDPOINT']}",
+    aws_access_key_id=os.environ["MINIO_ROOT_USER"],
+    aws_secret_access_key=os.environ["MINIO_ROOT_PASSWORD"],
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
 
 # Deliberately excludes image_embedding/text_embedding -- those are populated
 # later by precompute_embeddings.py, not by ingestion.
@@ -121,7 +133,7 @@ def process_channel(channel_ref, rows, skipped_shorts, finalized_ids):
         views = int(stats.get("viewCount", 0))
         genre = get_category_name(snippet.get("categoryId"))
 
-        thumb_path = download_thumbnail(video_id, snippet["thumbnails"], IMAGES_DIR)
+        thumb_path = download_thumbnail(video_id, snippet["thumbnails"], minio_client)
 
         sub_count_at_upload = get_subscriber_count_at(
             channel_id, published_at, fallback_count=subscriber_count
@@ -144,7 +156,6 @@ def process_channel(channel_ref, rows, skipped_shorts, finalized_ids):
 
 
 def main():
-    os.makedirs(IMAGES_DIR, exist_ok=True)
     channels = load_channels()
 
     existing_df = pd.read_sql(f"SELECT {', '.join(VIDEO_COLUMNS)} FROM videos", engine)
@@ -174,7 +185,6 @@ def main():
         print(f"\nDone. {len(df)} rows in videos table ({len(rows)} new/updated this run)")
 
     print(f"Skipped {skipped_shorts[0]} Shorts (<= {SHORTS_MAX_DURATION_SECONDS}s)")
-    print(f"Images saved to {IMAGES_DIR}/")
 
 
 if __name__ == "__main__":
