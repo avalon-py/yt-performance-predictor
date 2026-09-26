@@ -13,27 +13,24 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Create .env for CI
+        run: |
+          cat <<EOF > .env
+          POSTGRES_USER=ci_user
+          POSTGRES_PASSWORD=ci_pass
+          POSTGRES_DB=ci_db
+          MINIO_ROOT_USER=ci_minio
+          MINIO_ROOT_PASSWORD=ci_minio_pass
+          EOF
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build API image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          tags: yt-performance-predictor-api:ci
-          load: true          # loads the built image into the local docker daemon
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: docker compose build api
 
-      - name: Start API container
-        run: |
-          docker run -d \
-            --name api-ci \
-            -p 8000:8000 \
-            -e MODEL_BUNDLE_PATH=/app/models/bundles/latest_clip_b32_clip.pt \
-            -v ${{ github.workspace }}/models/bundles:/app/models/bundles:ro \
-            yt-performance-predictor-api:ci
+      - name: Start stack (postgres, minio, api)
+        run: docker compose up -d api
 
       - name: Wait for API to be healthy
         run: |
@@ -46,7 +43,7 @@ jobs:
             sleep 2
           done
           echo "API did not become healthy in time"
-          docker logs api-ci
+          docker compose logs api
           exit 1
 
       - name: Smoke test /health
@@ -68,8 +65,8 @@ jobs:
 
       - name: Dump logs on failure
         if: failure()
-        run: docker logs api-ci
+        run: docker compose logs
 
       - name: Clean up
         if: always()
-        run: docker rm -f api-ci || true
+        run: docker compose down -v
