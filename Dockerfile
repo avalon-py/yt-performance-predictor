@@ -24,6 +24,12 @@ COPY serving/ serving/
 COPY models/late_fusion_model.py models/precompute_embeddings.py models/
 COPY features/ features/
 
+RUN python -c "from transformers import CLIPModel, AutoTokenizer; \
+CLIPModel.from_pretrained('openai/clip-vit-base-patch32'); \
+AutoTokenizer.from_pretrained('openai/clip-vit-base-patch32')"
+
+ENV HF_HUB_OFFLINE=1
+
 # Bundle is NOT baked into the image (retrains shouldn't require a rebuild) --
 # it's mounted as a volume at runtime, see docker-compose.yml.
 ENV MODEL_BUNDLE_PATH=/app/models/bundles/latest_clip_b32_clip.pt

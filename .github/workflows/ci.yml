@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Create .env for CI
+        run: |
+          cat <<EOF > .env
+          POSTGRES_USER=ci_user
+          POSTGRES_PASSWORD=ci_pass
+          POSTGRES_DB=ci_db
+          MINIO_ROOT_USER=ci_minio
+          MINIO_ROOT_PASSWORD=ci_minio_pass
+          EOF
+
+      - name: Stage CI bundle
+        run: |
+          mkdir -p models/bundles
+          cp tests/fixtures/ci_bundle.pt models/bundles/latest_clip_b32_clip.pt
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        run: docker compose build api
+
+      - name: Start stack (postgres, minio, api)
+        run: docker compose up -d api
+
+      - name: Wait for API to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then
+              echo "API is up"
+              exit 0
+            fi
+            echo "Waiting for API... ($i)"
+            sleep 2
+          done
+          echo "API did not become healthy in time"
+          docker compose logs api
+          exit 1
+
+      - name: Smoke test /health
+        run: |
+          curl -sf http://localhost:8000/health | tee health_response.json
+          grep -q '"status":"ok"' health_response.json
+
+      - name: Smoke test /predict
+        run: |
+          curl -sf -X POST http://localhost:8000/predict \
+            -F "thumbnail=@tests/fixtures/sample_thumbnail.jpg" \
+            -F "title=Test Video Title" \
+            -F "subscriber_count_at_upload=10000" \
+            -F "trailing_avg_views=5000" \
+            -F "duration_seconds=600" \
+            -F "genre=Entertainment" \
+            | tee predict_response.json
+          grep -q '"expected_views"' predict_response.json
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Clean up
+        if: always()
+        run: docker compose down -v
