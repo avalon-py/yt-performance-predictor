@@ -184,6 +184,10 @@ docker run --rm --network ytpp_net `
 docker compose exec postgres psql -U ytpp -d ytpp -c "SELECT count(*), count(image_embedding), count(text_embedding) FROM videos;"
 # Make sure that all numbers of rows match.
 
+# 9. Training the model
+docker compose exec airflow-scheduler airflow dags unpause train_model # To unpause the training phase
+docker compose exec airflow-scheduler airflow dags trigger train_model # To actually run (trigger) the training phase
+docker compose exec airflow-scheduler airflow dags list-runs train_model # To see if it's done.
 ```
 
 **Known gaps / simplifications, not yet resolved:**
