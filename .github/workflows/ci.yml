@@ -23,6 +23,11 @@ jobs:
           MINIO_ROOT_PASSWORD=ci_minio_pass
           EOF
 
+      - name: Stage CI bundle
+        run: |
+          mkdir -p models/bundles
+          cp tests/fixtures/ci_bundle.pt models/bundles/latest_clip_b32_clip.pt
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
