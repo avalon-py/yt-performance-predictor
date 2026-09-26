@@ -87,3 +87,5 @@ tzdata==2026.4
 urllib3==2.8.0
 warcio==1.8.1
 wcwidth==0.8.4
+sqlalchemy==2.1.1
+psycopg2-binary==2.9.13
