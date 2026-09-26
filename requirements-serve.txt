@@ -17,4 +17,3 @@ sqlalchemy==2.1.1
 psycopg2-binary==2.9.13
 requests==2.34.2
 boto3==1.43.103
-sentence_transformers==6.1.0

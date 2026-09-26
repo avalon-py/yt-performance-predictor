@@ -1,46 +1,44 @@
 """
-Precompute frozen image and title embeddings ONCE, cache to disk. Encoders are
-frozen, so re-running them every epoch would be pure waste.
+Precompute CLIP image + title embeddings for videos missing them, writing
+directly into videos.image_embedding / videos.text_embedding in Postgres.
+Thumbnails are read from MinIO. Idempotent -- only processes rows where an
+embedding is still NULL.
+
+NOTE: ENCODERS / build_transform / build_image_encoder / postprocess /
+embed_titles_clip / load_clip_text_tower are UNCHANGED from the original
+dual-variant file -- serving/bundle.py and serving/features.py import these
+by name as their single source of truth for encoder preprocessing. Only
+main() and embed_images() (Postgres/MinIO orchestration, used only by this
+script) have changed.
 
 Usage:
-    python -m models.precompute_embeddings                                             # CLIP ViT-B/32 image, MiniLM+CLIP text (default)
-    python -m models.precompute_embeddings --image-encoder dinov2                       # DINOv2 image, MiniLM+CLIP text
-    python -m models.precompute_embeddings --image-encoder dinov2 --text-encoder clip   # DINOv2 image + CLIP text only, no MiniLM
-    python -m models.precompute_embeddings --text-encoder clip                          # skip MiniLM entirely
-    python -m models.precompute_embeddings --image-encoder clip_b32 --image-mode crop
-    python -m models.precompute_embeddings --image-encoder clip_b32 --limit 200         # smoke test
-
-Each run writes to its own folder, data/embeddings/<encoder>[_crop][_smoketest]/,
-plus a meta.json, so encoders never overwrite each other.
-
-NOTE: not executed here (no access to pretrained weights). Run with --limit
-first and check the printed shapes and scales before a full run.
+    python -m models.precompute_embeddings
+    python -m models.precompute_embeddings --limit 200   # smoke test
 """
 
 import argparse
-import json
+import io
 import os
 
+import boto3
 import numpy as np
 import pandas as pd
 import torch
+from botocore.config import Config
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+from dotenv import load_dotenv
+load_dotenv()
 
-CSV_PATH = "data/videos.csv"
-EMBEDDINGS_ROOT = "data/embeddings"
-TEXT_MODEL_NAME = "all-MiniLM-L6-v2"
-DEFAULT_CLIP_TEXT_MODEL = "openai/clip-vit-base-patch32"
+from sqlalchemy import create_engine, text
 
 IMAGENET_MEAN, IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
-# rescale=True: L2-normalize, then multiply by sqrt(dim) so each dimension has
-# RMS ~1. Unit-norm CLIP vectors have per-dim values around 0.04, which would
-# be swamped by EMBEDDING_NOISE_STD=0.02 and by the very low learning rate.
-# Cosine similarity is unaffected by this scaling.
+# --- unchanged from the original file: serving/bundle.py and
+# serving/features.py import these by name. ---
 ENCODERS = {
     "dinov2": dict(kind="dinov2", dim=384, mean=IMAGENET_MEAN, std=IMAGENET_STD,
                    interp=InterpolationMode.BILINEAR, rescale=False),
@@ -52,9 +50,9 @@ ENCODERS = {
 
 
 def build_transform(cfg, mode):
-    if mode == "squash":  # whole frame, 16:9 squeezed to square (your original behaviour)
+    if mode == "squash":
         resize = [transforms.Resize((224, 224), interpolation=cfg["interp"])]
-    else:  # "crop": short side to 224, then center crop (CLIP's default; loses the sides)
+    else:
         resize = [transforms.Resize(224, interpolation=cfg["interp"]), transforms.CenterCrop(224)]
     return transforms.Compose(
         resize + [transforms.ToTensor(), transforms.Normalize(cfg["mean"], cfg["std"])]
@@ -62,7 +60,6 @@ def build_transform(cfg, mode):
 
 
 def build_image_encoder(cfg, device):
-    """Returns (encode_fn, clip_model_or_None). Encoders are frozen."""
     if cfg["kind"] == "dinov2":
         model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
         clip_model = None
@@ -91,7 +88,73 @@ def postprocess(emb, cfg):
     return emb.astype(np.float32)
 
 
+def load_clip_text_tower(hf_name, device):
+    from transformers import CLIPModel
+    model = CLIPModel.from_pretrained(hf_name)
+    model.eval().to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
+def embed_titles_clip(df, clip_model, hf_name, device, batch_size=256):
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(hf_name)
+    titles = df["title"].fillna("").tolist()
+    chunks = []
+    for i in range(0, len(titles), batch_size):
+        enc = tokenizer(titles[i:i + batch_size], padding=True, truncation=True,
+                        max_length=77, return_tensors="pt").to(device)
+        with torch.inference_mode():
+            pooled = clip_model.text_model(
+                input_ids=enc["input_ids"], attention_mask=enc["attention_mask"]
+            ).pooler_output
+            chunks.append(clip_model.text_projection(pooled).float().cpu().numpy())
+    return np.concatenate(chunks)
+# --- end unchanged section ---
+
+
+DB_URL = (
+    f"postgresql+psycopg2://{os.environ['POSTGRES_USER']}:"
+    f"{os.environ['POSTGRES_PASSWORD']}@localhost:5432/{os.environ['POSTGRES_DB']}"
+)
+engine = create_engine(DB_URL)
+
+MINIO_BUCKET = "thumbnails"
+minio_client = boto3.client(
+    "s3",
+    endpoint_url=f"http://{os.environ['MINIO_ENDPOINT']}",
+    aws_access_key_id=os.environ["MINIO_ROOT_USER"],
+    aws_secret_access_key=os.environ["MINIO_ROOT_PASSWORD"],
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+)
+
+IMAGE_ENCODER = "clip_b32"  # only this script's own default choice -- ENCODERS
+                            # dict itself still holds all three, unchanged
+
+
+def to_vector_literal(values):
+    if values is None:
+        return None
+    return "[" + ",".join(f"{v:.6f}" for v in values) + "]"
+
+
+def fetch_thumbnail_image(object_key):
+    if not isinstance(object_key, str):
+        return None
+    try:
+        obj = minio_client.get_object(Bucket=MINIO_BUCKET, Key=object_key)
+        return Image.open(io.BytesIO(obj["Body"].read())).convert("RGB")
+    except Exception as e:
+        print(f"  [warn] failed to load {object_key}: {e}")
+        return None
+
+
 def embed_images(df, encode, transform, cfg, device, batch_size=32):
+    """Same shape as the original, source of images changed from local disk
+    to MinIO. Not imported by serving -- serving/features.py's encode_image()
+    mirrors this logic for a single image but calls build_transform/postprocess
+    directly, so this function changing internally doesn't affect serving."""
     embeddings = np.zeros((len(df), cfg["dim"]), dtype=np.float32)
     valid_mask = np.zeros(len(df), dtype=bool)
     batch_imgs, batch_idxs = [], []
@@ -107,145 +170,72 @@ def embed_images(df, encode, transform, cfg, device, batch_size=32):
         batch_imgs.clear()
         batch_idxs.clear()
 
-    for i, path in enumerate(df["thumbnail_path"]):
-        if not isinstance(path, str) or not os.path.exists(path):
+    for i, object_key in enumerate(df["thumbnail_path"]):
+        img = fetch_thumbnail_image(object_key)
+        if img is None:
             continue
-        try:
-            img = Image.open(path).convert("RGB")
-            batch_imgs.append(transform(img))
-            batch_idxs.append(i)
-        except Exception as e:
-            print(f"  [warn] failed to load {path}: {e}")
-            continue
+        batch_imgs.append(transform(img))
+        batch_idxs.append(i)
         if len(batch_imgs) >= batch_size:
             flush()
     flush()
-
     return embeddings, valid_mask
 
 
-def embed_titles(df, text_encoder, batch_size=64):
-    titles = df["title"].fillna("").tolist()
-    embeddings = text_encoder.encode(titles, batch_size=batch_size, show_progress_bar=True)
-    return embeddings.astype(np.float32)
-
-
-def load_clip_text_tower(hf_name, device):
-    """Loads just what's needed for title embeddings via CLIP's text tower --
-    used when the chosen image encoder isn't CLIP, so CLIP text embeddings
-    don't require also encoding images with CLIP."""
-    from transformers import CLIPModel
-    model = CLIPModel.from_pretrained(hf_name)
-    model.eval().to(device)
-    for p in model.parameters():
-        p.requires_grad = False
-    return model
-
-
-def embed_titles_clip(df, clip_model, hf_name, device, batch_size=256):
-    """Titles through CLIP's own text tower, same space as the CLIP image embeddings."""
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(hf_name)
-    titles = df["title"].fillna("").tolist()
-    chunks = []
-    for i in range(0, len(titles), batch_size):
-        enc = tokenizer(titles[i:i + batch_size], padding=True, truncation=True,
-                        max_length=77, return_tensors="pt").to(device)
-        with torch.inference_mode():
-            pooled = clip_model.text_model(
-                input_ids=enc["input_ids"], attention_mask=enc["attention_mask"]
-            ).pooler_output
-            chunks.append(clip_model.text_projection(pooled).float().cpu().numpy())
-    return np.concatenate(chunks)
+def update_embeddings(df, image_emb, valid_mask, text_emb):
+    with engine.begin() as conn:
+        for i, row in df.reset_index(drop=True).iterrows():
+            conn.execute(
+                text("""
+                    UPDATE videos
+                    SET image_embedding = :image_embedding,
+                        text_embedding = :text_embedding
+                    WHERE video_id = :video_id
+                """),
+                {
+                    "video_id": row["video_id"],
+                    "image_embedding": to_vector_literal(image_emb[i]) if valid_mask[i] else None,
+                    "text_embedding": to_vector_literal(text_emb[i]),
+                },
+            )
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image-encoder", choices=list(ENCODERS), default="clip_b32")
-    parser.add_argument("--image-mode", choices=["squash", "crop"], default="squash")
-    parser.add_argument("--text-encoder", choices=["minilm", "clip", "both"], default="both",
-                         help="which title embedding(s) to compute. 'both' keeps MiniLM available "
-                              "for comparison/ablation even though CLIP text has been outperforming it.")
-    parser.add_argument("--clip-text-model", default=DEFAULT_CLIP_TEXT_MODEL,
-                         help="CLIP checkpoint used for title embeddings when --image-encoder isn't "
-                              "a CLIP variant, or to force a specific text tower regardless of image encoder.")
-    parser.add_argument("--limit", type=int, default=None, help="only embed the first N rows (smoke test)")
+    parser.add_argument("--limit", type=int, default=None,
+                         help="only embed the first N pending rows (smoke test)")
     args = parser.parse_args()
 
-    cfg = ENCODERS[args.image_encoder]
-    out_name = (args.image_encoder
-                + ("_crop" if args.image_mode == "crop" else "")
-                + ("_smoketest" if args.limit else ""))
-    out_dir = os.path.join(EMBEDDINGS_ROOT, out_name)
-    os.makedirs(out_dir, exist_ok=True)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    df = pd.read_csv(CSV_PATH)
+    cfg = ENCODERS[IMAGE_ENCODER]
+
+    query = ("SELECT video_id, title, thumbnail_path FROM videos "
+              "WHERE image_embedding IS NULL OR text_embedding IS NULL")
     if args.limit:
-        df = df.head(args.limit)
-    print(f"Loaded {len(df)} rows from {CSV_PATH}; device={device}; output -> {out_dir}")
+        query += f" LIMIT {args.limit}"
+    df = pd.read_sql(query, engine)
+    print(f"{len(df)} rows pending embeddings (device={device})")
 
-    print(f"Building image encoder ({args.image_encoder}, frozen)...")
+    if df.empty:
+        print("Nothing to do.")
+        return
+
+    print(f"Building image encoder ({IMAGE_ENCODER}, frozen)...")
     encode, clip_model = build_image_encoder(cfg, device)
-    transform = build_transform(cfg, args.image_mode)
+    transform = build_transform(cfg, "squash")
 
-    print("Embedding thumbnails...")
-    image_embeddings, valid_mask = embed_images(df, encode, transform, cfg, device)
-    image_embeddings = postprocess(image_embeddings, cfg)
+    print("Embedding thumbnails (from MinIO)...")
+    image_emb, valid_mask = embed_images(df, encode, transform, cfg, device)
+    image_emb = postprocess(image_emb, cfg)
 
-    np.save(os.path.join(out_dir, "image_embeddings.npy"), image_embeddings)
-    np.save(os.path.join(out_dir, "valid_image_mask.npy"), valid_mask)
-    df[["video_id"]].to_csv(os.path.join(out_dir, "video_id_order.csv"), index=False)
+    print("Embedding titles (CLIP text tower)...")
+    text_emb = postprocess(embed_titles_clip(df, clip_model, cfg["hf_name"], device), {"rescale": True})
 
-    want_minilm = args.text_encoder in ("minilm", "both")
-    want_clip_text = args.text_encoder in ("clip", "both")
-    text_dim = None
+    print("Writing embeddings back to Postgres...")
+    update_embeddings(df, image_emb, valid_mask, text_emb)
 
-    if want_minilm:
-        from sentence_transformers import SentenceTransformer
-        print("Loading title encoder (MiniLM)...")
-        text_encoder = SentenceTransformer(TEXT_MODEL_NAME)
-        print("Embedding titles (MiniLM)...")
-        text_embeddings = embed_titles(df, text_encoder)
-        np.save(os.path.join(out_dir, "text_embeddings.npy"), text_embeddings)
-        text_dim = text_embeddings.shape[1]
-
-    if want_clip_text:
-        # Reuse the already-loaded CLIP model when the image encoder is CLIP
-        # (free byproduct, same as before); otherwise load just the text
-        # tower separately -- CLIP text embeddings no longer require also
-        # encoding images with CLIP.
-        if clip_model is not None:
-            text_tower, text_tower_name = clip_model, cfg["hf_name"]
-        else:
-            print(f"Loading separate CLIP text tower ({args.clip_text_model}) for titles...")
-            text_tower, text_tower_name = load_clip_text_tower(args.clip_text_model, device), args.clip_text_model
-
-        print("Embedding titles (CLIP text tower)...")
-        clip_text = postprocess(
-            embed_titles_clip(df, text_tower, text_tower_name, device), {"rescale": True}
-        )
-        np.save(os.path.join(out_dir, "clip_text_embeddings.npy"), clip_text)
-        text_dim = text_dim or clip_text.shape[1]
-
-    meta = {
-        "image_encoder": args.image_encoder,
-        "image_mode": args.image_mode,
-        "image_dim": int(image_embeddings.shape[1]),
-        "rescaled_to_unit_rms": cfg["rescale"],
-        "text_encoders_saved": [n for n, w in [("minilm", want_minilm), ("clip", want_clip_text)] if w],
-        "clip_text_model": args.clip_text_model if want_clip_text else None,
-        "text_dim": int(text_dim) if text_dim is not None else None,
-        "n_rows": int(len(df)),
-        "n_valid_images": int(valid_mask.sum()),
-    }
-    with open(os.path.join(out_dir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-
-    print(f"\nDone. {valid_mask.sum()}/{len(df)} rows have valid image embeddings.")
-    print(f"image embeddings: shape={image_embeddings.shape}, "
-          f"mean per-dim std={image_embeddings[valid_mask].std(axis=0).mean():.3f}")
-    print(f"Saved to {out_dir}/")
+    print(f"\nDone. {valid_mask.sum()}/{len(df)} rows got a valid image embedding "
+          f"({len(df) - valid_mask.sum()} thumbnails failed to load).")
 
 
 if __name__ == "__main__":
