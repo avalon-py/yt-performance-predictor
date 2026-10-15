@@ -44,6 +44,8 @@ CI_REJECT_MARGIN = float(os.environ.get("PROMOTION_CI_REJECT_MARGIN", "-0.01"))
 N_BOOTSTRAP = int(os.environ.get("PROMOTION_N_BOOTSTRAP", "2000"))
 BOOTSTRAP_SEED = int(os.environ.get("PROMOTION_BOOTSTRAP_SEED", "42"))   # train.py memakai env SEED (42)
 ANCHOR_MARGIN = float(os.environ.get("PROMOTION_ANCHOR_MARGIN", "0.0"))
+# Bukti minimum saat baris yang pernah dilihat model live/anchor dikeluarkan dari test (aturan video_id).
+MIN_UNSEEN = int(os.environ.get("PROMOTION_MIN_UNSEEN", "300"))
 PROMOTION_LOG_PATH = "experiments/promotions.jsonl"
 
 # String alasan identik dengan models/train.py (log lama dan baru bisa dibaca seragam).
@@ -51,6 +53,7 @@ REASON_HARD_GATE = "failed hard gate: did not beat linear (trailing_avg_views) b
 REASON_FIRST = "no currently-served bundle to compare against (first promotion)"
 REASON_REJECT = "CI confidently below reject margin -- new model is worse than live model"
 REASON_PROMOTE = "beat hard gate; not confidently worse than live model (ties go to newer)"
+REASON_INSUFFICIENT = "not enough test rows unseen by the live/anchor models to compare fairly (not promoted)"
 REASON_ANCHOR = "CI confidently below the fixed anchor model -- candidate regressed against the reference"
 
 
@@ -140,6 +143,35 @@ def decide(*, new_preds, targets, baseline_spearman, old_preds=None, first_promo
                     decision.update(promoted=False, reason=REASON_ANCHOR)
     decision.update(extra or {})
     return decision
+
+
+def unseen_mask(test_ids, *seen_sets):
+    """True untuk baris test yang TIDAK pernah dilatih oleh model mana pun di seen_sets (himpunan video_id).
+
+    Entri None/kosong diabaikan. Ini pengganti pagar waktu bila daftar id latih tersedia: baris yang
+    disisipkan mundur di waktu (kanal baru, video yang baru final) membuat awal test kandidat lebih awal
+    dari train_end live tanpa berarti live melihatnya; yang dikeluarkan hanya yang benar-benar dilihat.
+    """
+    ids = list(test_ids)
+    keep = np.ones(len(ids), dtype=bool)
+    for seen in seen_sets:
+        if not seen:
+            continue
+        seen = seen if isinstance(seen, (set, frozenset)) else set(seen)
+        keep &= np.fromiter((i not in seen for i in ids), dtype=bool, count=len(ids))
+    return keep
+
+
+def insufficient_evidence(*, versioned_path, n_test, n_evaluated, min_unseen, extra=None):
+    """Keputusan 'tidak dipromosikan' bila terlalu sedikit baris yang adil untuk dibandingkan."""
+    d = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "versioned_path": str(versioned_path) if versioned_path is not None else None,
+        "promoted": False, "reason": REASON_INSUFFICIENT, "new_spearman": None,
+        "n_test": int(n_test), "n_evaluated": int(n_evaluated), "min_unseen": int(min_unseen),
+    }
+    d.update(extra or {})
+    return d
 
 
 def check_no_leak(live_train_end, test_start):

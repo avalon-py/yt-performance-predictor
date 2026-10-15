@@ -18,8 +18,8 @@ The demo is rate-limited per IP (Vercel Firewall) because each prediction runs C
 | HTTPS, request gating (Caddy) | Done: API key, 5 MB body cap |
 | Web UI (Next.js on Vercel, separate repo) | Done, with per-IP rate limiting |
 | Airflow: ingest, embed, drift monitoring | Done, running on the VM (localhost-only) |
-| Airflow: `train_model` (late fusion) + promotion gate | Implemented, **paused** since the switch to the early-fusion model |
-| Automatic retraining of the early-fusion model | Not built yet (see [Roadmap](#roadmap)); retraining is manual for now |
+| Airflow: `train_model` (early-fusion retraining + promotion gate) | Implemented: staged, resumable retraining, three-gate promotion, atomic swap with a one-step rollback. Runs after `embed_new`; see [Retraining and promotion](#retraining-and-promotion) |
+| Late-fusion `train_model` (old) | Replaced. `models/train.py` stays as library code and baseline, no DAG calls it |
 | Backups | Not built yet |
 
 ## Architecture
@@ -31,7 +31,7 @@ Browser ──► Vercel (Next.js UI + /api/predict proxy, per-IP rate limit)
 Oracle VM ─► Caddy (HTTPS, key check, 5 MB cap) ─► FastAPI (CLIP token extractor + early-fusion ensemble)
                                                         ▲ loads the bundle at MODEL_BUNDLE_PATH
 Airflow (localhost only)                                │ restarted after a promotion
-  ingest_new ─► embed_new ─► train_model (paused) ──────┘
+  ingest_new ─► embed_new ─► train_model ───────────────┘
       └──────► monitor_drift
   each task runs in a `ytpp-worker` container against Postgres + MinIO
 ```
@@ -71,7 +71,7 @@ YouTube Data API v3 (`playlistItems.list` + `videos.list`; `search.list` is avoi
 
 Stored per video: title, views, duration, publish date, subscriber count, genre (YouTube category), title statistics, trailing average, `is_first_video`, thumbnail (MinIO) and CLIP embeddings (pgvector).
 
-The early-fusion model was trained on a frozen snapshot (`c14dba895034fc4c`): 11,285 videos from 135 channels, split chronologically 80/10/10 (train 9,028, val 1,128, test 1,129). Videos ingested after that snapshot are not used by the served model yet.
+The early-fusion model was trained on a frozen snapshot (`c14dba895034fc4c`): 11,285 videos from 135 channels, split chronologically 80/10/10 (train 9,028, val 1,128, test 1,129). That is where the served model started. Every retraining run exports a fresh snapshot from Postgres, so newer videos reach the model through the `train_model` DAG (see below).
 
 ## Model v2 (early fusion, RATF): served
 
@@ -119,14 +119,42 @@ Ablation: tabular-only 0.277, then +image 0.302, +text 0.308, full fusion 0.317.
 
 ## Retraining and promotion
 
-**Late fusion (`train_model`, paused).** It trains on all embedded, finalized rows and always writes a versioned bundle. Promotion to `latest_clip_b32_clip.pt` needs two gates:
+`train_model` runs `python -m early_fusion.retrain all` in a `ytpp-worker` container. The stages are resumable (an interrupted run continues with `--run-id <id>`; finished seeds are not retrained):
 
-1. **Hard gate:** beat a linear trailing-average baseline.
-2. **Soft gate:** a paired bootstrap CI on (new - live) Spearman on the same test rows. Rejected only if the CI's upper bound is below `PROMOTION_CI_REJECT_MARGIN` (default -0.01), so ties go to the newer model.
+1. **export**: a fresh snapshot from Postgres (finalized videos with a thumbnail embedding, ordered by `published_at, video_id`, split chronologically 80/10/10).
+2. **tokens**: the token store (keyed by `video_id`) is brought up to date; only new videos are extracted. A batch with many failed thumbnails is refused instead of being stored as zero tokens.
+3. **split**, 4. **train** (5 seeds, refit on train+val for 8 epochs, the same recipe as the served bundle), 5. **package**, 6. **verify** (the candidate reloads, reproduces its training predictions and its tabular path).
+7. **gate**: the candidate and the live bundle are scored on the **newest 10%** of the snapshot, which the candidate never trained on. Videos the live (or anchor) model *did* train on are excluded **by `video_id`**: every bundle keeps the ids it was trained on in a `.split.json` file. A timestamp rule alone is too coarse, because videos inserted back in time (new channels, newly finalized videos) can start the test slice before the live model's `train_end` although the live model never saw them. If fewer than `PROMOTION_MIN_UNSEEN` (300) rows remain, the decision is "not promoted: not enough unseen rows" (not a task failure). A bundle without a split file falls back to the strict timestamp rule (the run stops if the live model's `train_end` is not before the test slice).
+   - *Hard gate:* beat a linear trailing-average baseline.
+   - *Soft gate:* paired bootstrap on (candidate - live) Spearman; rejected only if the CI's upper bound is below `PROMOTION_CI_REJECT_MARGIN` (-0.01), so ties go to the newer model.
+   - *Anchor gate:* the candidate is also compared, on the same rows, with a fixed reference bundle (`m6_anchor.pt`); rejected if the CI's upper bound is below `PROMOTION_ANCHOR_MARGIN` (0.0). This bounds the cumulative loss that repeated "ties go to newer" promotions could add up to. It catches regressions, not drift that hurts every model.
+8. **promote** (`--promote`, standard runs only): the live bundle is copied to `m6_prev.*`, then `m6_latest.*` is replaced atomically. Each `.json` carries the bundle's sha256, `train_end` and training size, and the gate refuses a bundle whose hash does not match.
 
-After a promotion the DAG restarts the `api` container (found by its compose service label) so it loads the new bundle. Decisions are logged to `experiments/promotions.jsonl`. `monitor_drift` (KS tests plus channel-mix shift) is informational only and logs to `experiments/drift_reports.jsonl`.
+Nothing is promoted unless the gate says so, and `applied` in the final JSON line says whether the files were actually replaced. The DAG restarts the `api` container (found by its compose label) only when `applied` is true. Every decision is appended to `experiments/promotions.jsonl`.
 
-**Early fusion (manual for now).** The served bundle was trained once on the frozen snapshot; the commands are in `docs/early_fusion/README.md` (section 9.1). Ingestion and embedding keep collecting new data, but it does not reach the served model until automatic retraining exists.
+Be aware of what the soft gate is: a filter for clearly worse models, not for slightly worse ones. In a simulation with this test-set size, a candidate whose true Spearman is 0.03 lower is still promoted about 90% of the time, and one that is 0.05 lower about half the time. The anchor gate and the logged history are there to watch for slow decline.
+
+Files in `models/bundles/` (the directory the `api` service mounts read-only):
+
+| File | Role |
+|---|---|
+| `m6_latest.pt` + `.json` | the live bundle; `MODEL_BUNDLE_PATH` points here |
+| `m6_prev.pt` + `.json` | the previous live bundle: roll back by promoting it again (see below) |
+| `m6_anchor.pt` + `.json` | fixed reference for the anchor gate; never overwritten by a promotion |
+| `m6_*.split.json` | the train+val `video_id`s each bundle was trained on; the gate uses them to leave those rows out of the comparison |
+
+```bash
+python -m early_fusion.live_bundle status                  # hashes and train_end of latest / prev / anchor
+python -m early_fusion.live_bundle bootstrap --src <current bundle> --train-end "<newest published_at in its train+val>" --snapshot-n-total <rows> --split-json <the split.json it was trained with>
+# roll back to the previous bundle (then restart the api container):
+python -c "from early_fusion import live_bundle as lb; print(lb.promote('models/bundles/m6_prev.pt', 'models/bundles'))"
+```
+
+Skip rule: `--min-new-rows N` (DAG: `RETRAIN_MIN_NEW_ROWS`, default 100) ends the run right after the export when the snapshot has fewer than N more rows than the live bundle was trained on; the final JSON then has `skipped: true`.
+
+Training speed depends on the machine. On a GPU it takes minutes per seed; on the VM's 2-core CPU a full run (5 seeds x 8 epochs, 1 thread) took about 8 hours, during which the API answers roughly 3-4 times slower (about 1.4 s instead of 0.37 s per request); it returns to normal when the run ends. That trade-off is accepted for a monthly job on a single VM. `--threads` limits the CPU threads so the API keeps a core. Runs are written under `data_snapshots/retrain/<run id>/` and are not pruned automatically.
+
+**Late fusion** (`models/train.py`) keeps its own two-gate rule (hard gate, soft gate) and its code, but no DAG calls it any more. `monitor_drift` (KS tests plus channel-mix shift) is informational only and logs to `experiments/drift_reports.jsonl`.
 
 ## Security layers
 
@@ -158,7 +186,18 @@ Variables read by the `api` service (set in `docker-compose.yml` or a `docker-co
 | Variable | Purpose |
 |---|---|
 | `MODEL_BUNDLE_PATH` | Bundle to serve, e.g. `/app/models/bundles/m6_granular_ensemble_v1.pt` |
-| `MODEL_TRAIN_END` | Optional. Date shown as `train_end` in `/health` and `/predict` (otherwise the snapshot id is shown) |
+| `MODEL_TRAIN_END` | Optional. Date shown as `train_end` in `/health` and `/predict` when the bundle itself has none (bundles written by retraining carry their own `train_end`) |
+
+Variables read by the Airflow containers when the `train_model` DAG is parsed (defaults are conservative):
+
+| Variable | Purpose |
+|---|---|
+| `RETRAIN_THREADS` | torch CPU threads for the worker (default 1: leave cores for the API) |
+| `RETRAIN_MIN_NEW_ROWS` | skip retraining when fewer new videos than this since the live bundle (default 100) |
+| `RETRAIN_TIMEOUT_HOURS` | task timeout (default 14; 5 seeds x 8 epochs took about 8 hours at 1 thread on the VM) |
+| `RETRAIN_MEM_LIMIT` | memory cap of the worker container (default `6g`) |
+| `RETRAIN_USE_ANCHOR` | `0` disables the anchor gate (default on) |
+| `PROMOTION_CI_REJECT_MARGIN`, `PROMOTION_ANCHOR_MARGIN`, `PROMOTION_N_BOOTSTRAP`, `PROMOTION_MIN_UNSEEN` | gate margins, bootstrap size and the minimum number of unseen test rows (read by the worker; defaults -0.01, 0.0, 2000, 300) |
 
 ## Running it
 
@@ -232,7 +271,7 @@ docker compose up -d airflow-api-server airflow-scheduler airflow-dag-processor
 docker compose logs airflow-api-server | grep password          # admin password, printed once
 ```
 
-The UI is on `localhost:8080` (SSH-tunnel it on the VM). Unpause and trigger `ingest_new`, which chains into `embed_new`, `train_model` (late fusion) and `monitor_drift`.
+The UI is on `localhost:8080` (SSH-tunnel it on the VM). Unpause and trigger `ingest_new`, which chains into `embed_new`, `train_model` (early-fusion retraining; it skips itself when there are fewer than `RETRAIN_MIN_NEW_ROWS` new videos) and `monitor_drift`.
 
 Consistency checks:
 
@@ -248,7 +287,8 @@ python -m pipeline.check_consistency     # Postgres thumbnail_path vs MinIO obje
 
 ## Known limitations
 
-- The served model is trained on a frozen snapshot and is not retrained automatically yet.
+- Retraining is automatic but cautious: a candidate replaces the live model unless it is confidently worse than the live model or the fixed anchor on the newest unseen slice, so slow quality decline is possible without any single rejection (see Retraining and promotion). Watch `experiments/promotions.jsonl`.
+- Each retraining trains 5 seeds on CPU if it runs on the VM: slow, and runs are not pruned automatically.
 - Its output is a **ranking score**: single members are not well calibrated in absolute level (per-seed MAE 0.48 to 0.56), averaging 5 members brings MAE to 0.476, and the views range returned by the API is a typical-error band, not a guarantee.
 - One temporal split and large seed-to-seed variance: single-seed comparisons are unreliable (details and caveats: `docs/early_fusion/README.md`, section 8).
 - Late fusion only: `subscriber_count_at_upload` is the channel's **current** count, not the count at publish time (TubeCensus is stubbed). The early-fusion model does not use it.
@@ -259,8 +299,8 @@ python -m pipeline.check_consistency     # Postgres thumbnail_path vs MinIO obje
 
 ## Roadmap
 
-- Automatic retraining of the early-fusion model: incremental token cache, 5-seed refit, a promotion gate for the ensemble, and an API restart after promotion.
-- Write the real `train_end` date into the bundle at packaging time (so `MODEL_TRAIN_END` is no longer needed).
+- Alerting when a `train_model` run fails or is skipped repeatedly, and pruning of old runs under `data_snapshots/retrain/`.
+- Optional: train on a GPU machine and ship only the candidate bundle (needs a small sync tool for new token-store rows).
 - Auto-fill subscribers and average views from a channel handle.
 - Nightly off-VM backup of Postgres and MinIO.
 - Move credentials to Airflow Connections or a secrets backend.
@@ -272,7 +312,7 @@ ingestion/   YouTube client, thumbnail downloader (MinIO), subscriber lookup (st
 features/    title features, trailing views, target
 pipeline/    run_ingestion, check_consistency, monitor_drift, config/
 models/      precompute_embeddings, dataset, late_fusion_model, train, baseline, ablations
-early_fusion/ RATF model code, token extractor, ensemble inference, experiments, results, split
+early_fusion/ RATF model code, token extractor and store, retraining pipeline (retrain.py), promotion gate (promotion.py), live bundle files (live_bundle.py), experiments, results, split
 serving/     FastAPI app, late-fusion bundle loader, early-fusion bundle loader (ratf_bundle)
 scripts/     snapshot export, token-cache build/verify, audits
 dags/        ingest_new, embed_new, train_model, monitor_drift

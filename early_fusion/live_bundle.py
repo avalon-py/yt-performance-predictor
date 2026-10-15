@@ -33,8 +33,32 @@ LATEST, PREV, ANCHOR = "m6_latest", "m6_prev", "m6_anchor"
 DEFAULT_BUNDLES = Path("models/bundles")
 
 
+SPLIT_SUFFIX = ".split.json"
+
+
 def sidecar_path(pt):
     return Path(pt).with_suffix(".json")
+
+
+def split_path(pt):
+    """Daftar id yang dilatih bundle ini (train+val), berdampingan dengan bundle: m6_latest.split.json."""
+    p = Path(pt)
+    return p.with_name(p.stem + SPLIT_SUFFIX)
+
+
+def _compact_split(split):
+    """Hanya yang dibutuhkan gerbang: hash snapshot dan id train/val (id test tidak ikut)."""
+    return {"snapshot_hash": split.get("snapshot_hash"), "train_ids": list(split["train_ids"]),
+            "val_ids": list(split["val_ids"])}
+
+
+def read_seen_ids(pt):
+    """Himpunan video_id yang dilatih bundle ini (train+val), atau None bila daftarnya tidak ada."""
+    p = split_path(pt)
+    if not p.exists():
+        return None
+    d = json.loads(p.read_text())
+    return set(d["train_ids"]) | set(d["val_ids"])
 
 
 def read_sidecar(pt):
@@ -71,6 +95,7 @@ def _atomic_copy(src, dst):
     tmp = dst.with_name(dst.name + ".new")
     shutil.copyfile(src, tmp)
     with open(tmp, "r+b") as f:
+        f.flush()
         os.fsync(f.fileno())
     return tmp
 
@@ -85,8 +110,14 @@ def _write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
-def bootstrap(src_pt, bundles_dir=DEFAULT_BUNDLES, *, train_end, snapshot_n_total, src_json=None, force=False):
-    """Buat m6_latest.* dan m6_anchor.* dari bundle yang sedang live (v1). Sumber tidak diubah."""
+def bootstrap(src_pt, bundles_dir=DEFAULT_BUNDLES, *, train_end, snapshot_n_total, src_json=None, force=False,
+              split_json=None):
+    """Buat m6_latest.* dan m6_anchor.* dari bundle yang sedang live (v1). Sumber tidak diubah.
+
+    split_json: split.json yang dipakai melatih bundle itu (v1: early_fusion/splits/temporal_no_subs.json).
+    Daftar id train+val-nya ditulis ke m6_latest.split.json dan m6_anchor.split.json supaya gerbang bisa
+    mengeluarkan baris test yang pernah dilihat model (aturan video_id).
+    """
     src_pt = Path(src_pt)
     bundles_dir = Path(bundles_dir)
     if not src_pt.exists():
@@ -98,6 +129,7 @@ def bootstrap(src_pt, bundles_dir=DEFAULT_BUNDLES, *, train_end, snapshot_n_tota
     bundles_dir.mkdir(parents=True, exist_ok=True)
     meta = {**side, "sha256": src_sha, "train_end": str(train_end), "snapshot_n_total": int(snapshot_n_total),
             "bootstrapped_from": src_pt.name, "bootstrapped_at": _now()}
+    compact = _compact_split(json.loads(Path(split_json).read_text())) if split_json else None
     out = {}
     for name, role in ((LATEST, "live"), (ANCHOR, "anchor")):
         dst = bundles_dir / f"{name}.pt"
@@ -106,6 +138,9 @@ def bootstrap(src_pt, bundles_dir=DEFAULT_BUNDLES, *, train_end, snapshot_n_tota
                 out[name] = "sudah ada (identik)"
                 if not sidecar_path(dst).exists():
                     _write_json_atomic(sidecar_path(dst), {**meta, "role": role})
+                if compact is not None and (force or not split_path(dst).exists()):
+                    _write_json_atomic(split_path(dst), compact)
+                    out[name] += " + split ditulis"
                 continue
             if not force:
                 raise FileExistsError(f"{dst} sudah ada dan berbeda dari sumber; --force untuk menimpa")
@@ -116,11 +151,19 @@ def bootstrap(src_pt, bundles_dir=DEFAULT_BUNDLES, *, train_end, snapshot_n_tota
         os.replace(tmp, dst)
         _write_json_atomic(sidecar_path(dst), {**meta, "role": role})
         out[name] = "dibuat"
+        if compact is not None:
+            _write_json_atomic(split_path(dst), compact)
+            out[name] += " + split"
     return out
 
 
-def promote(candidate_pt, bundles_dir=DEFAULT_BUNDLES):
-    """Jadikan kandidat bundle live: latest lama disalin ke prev, latest diganti kandidat."""
+def promote(candidate_pt, bundles_dir=DEFAULT_BUNDLES, split_json=None):
+    """Jadikan kandidat bundle live: latest lama disalin ke prev, latest diganti kandidat.
+
+    split_json: split.json run kandidat; id train+val-nya menjadi m6_latest.split.json (dan split live lama
+    ikut disalin ke m6_prev.split.json). Tanpa split_json, split latest yang lama DIHAPUS: daftar itu milik
+    model yang sudah diganti, dan membiarkannya akan mengeluarkan baris yang salah dari gerbang berikutnya.
+    """
     candidate_pt = Path(candidate_pt)
     bundles_dir = Path(bundles_dir)
     cand_json = sidecar_path(candidate_pt)
@@ -130,6 +173,7 @@ def promote(candidate_pt, bundles_dir=DEFAULT_BUNDLES):
     cand_sha = sha256_file(candidate_pt)
     if side.get("sha256") != cand_sha:
         raise ValueError(f"sha256 kandidat tidak cocok dengan sidecar-nya: {candidate_pt}")
+    new_split = _compact_split(json.loads(Path(split_json).read_text())) if split_json else None
     bundles_dir.mkdir(parents=True, exist_ok=True)
     latest, prev = bundles_dir / f"{LATEST}.pt", bundles_dir / f"{PREV}.pt"
 
@@ -144,11 +188,19 @@ def promote(candidate_pt, bundles_dir=DEFAULT_BUNDLES):
             os.replace(tmp_prev, prev)
             if sidecar_path(latest).exists():
                 _write_json_atomic(sidecar_path(prev), {**json.loads(sidecar_path(latest).read_text()), "role": "prev"})
+            if split_path(latest).exists():
+                _write_json_atomic(split_path(prev), json.loads(split_path(latest).read_text()))
+            elif split_path(prev).exists():
+                split_path(prev).unlink()                        # split prev milik model yang lebih lama lagi
         os.replace(staged, latest)                                # 3. ganti latest (atomik)
         live_side = {**side, "sha256": cand_sha, "role": "live", "promoted_at": _now()}
         if snapshot_n_total(side) is not None:                    # supaya --min-new-rows tetap bekerja setelah promosi
             live_side["snapshot_n_total"] = snapshot_n_total(side)
         _write_json_atomic(sidecar_path(latest), live_side)
+        if new_split is not None:
+            _write_json_atomic(split_path(latest), new_split)
+        elif split_path(latest).exists():
+            split_path(latest).unlink()
     except Exception:
         if staged.exists():
             staged.unlink()
@@ -167,7 +219,7 @@ def status(bundles_dir=DEFAULT_BUNDLES):
         sha = sha256_file(pt)
         out[name] = {"sha256": sha, "sidecar_ok": (not side.get("sha256")) or side["sha256"] == sha,
                      "train_end": side.get("train_end"), "snapshot_n_total": snapshot_n_total(side),
-                     "role": side.get("role")}
+                     "role": side.get("role"), "has_split": split_path(pt).exists()}
     return out
 
 
@@ -180,13 +232,16 @@ def main(argv=None):
     b.add_argument("--train-end", required=True, help="waktu publikasi terbaru di train+val bundle itu")
     b.add_argument("--snapshot-n-total", type=int, required=True, help="jumlah baris snapshot pelatihannya")
     b.add_argument("--bundles-dir", default=str(DEFAULT_BUNDLES))
+    b.add_argument("--split-json", default=None,
+                   help="split.json bundle sumber (v1: early_fusion/splits/temporal_no_subs.json); id train+val dipakai gerbang")
     b.add_argument("--force", action="store_true")
     s = sub.add_parser("status")
     s.add_argument("--bundles-dir", default=str(DEFAULT_BUNDLES))
     args = ap.parse_args(argv)
     if args.cmd == "bootstrap":
         res = bootstrap(args.src, args.bundles_dir, train_end=args.train_end,
-                        snapshot_n_total=args.snapshot_n_total, src_json=args.src_json, force=args.force)
+                        snapshot_n_total=args.snapshot_n_total, src_json=args.src_json, force=args.force,
+                        split_json=args.split_json)
     else:
         res = status(args.bundles_dir)
     print(json.dumps(res, indent=2))

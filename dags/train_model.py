@@ -21,7 +21,9 @@ What must exist on the host before the first run (HOST_PROJECT_DIR is the repo a
 Knobs (environment of the Airflow containers; defaults are conservative):
   RETRAIN_THREADS         torch CPU threads for the worker (default 1: leave cores for the API)
   RETRAIN_MIN_NEW_ROWS    skip retraining when fewer new videos than this since the live bundle (default 100)
-  RETRAIN_TIMEOUT_HOURS   task timeout (default 12)
+  RETRAIN_TIMEOUT_HOURS   task timeout (default 14; 5 seeds x 8 epochs took ~8 h at 1 thread on the VM, and the
+                          data grows every month)
+  RETRAIN_MEM_LIMIT       memory cap of the worker container (default 6g: an out-of-memory kill takes the worker, not the API)
   RETRAIN_USE_ANCHOR      "0" disables the anchor gate (default on)
 
 XCom: xcom_all=True hands back every line of container output; the decision is the last line that is a JSON
@@ -47,7 +49,8 @@ HOST_PROJECT_DIR = os.environ["HOST_PROJECT_DIR"]
 
 RETRAIN_THREADS = os.environ.get("RETRAIN_THREADS", "1")
 RETRAIN_MIN_NEW_ROWS = os.environ.get("RETRAIN_MIN_NEW_ROWS", "100")
-RETRAIN_TIMEOUT_HOURS = int(os.environ.get("RETRAIN_TIMEOUT_HOURS", "12"))
+RETRAIN_TIMEOUT_HOURS = int(os.environ.get("RETRAIN_TIMEOUT_HOURS", "14"))
+RETRAIN_MEM_LIMIT = os.environ.get("RETRAIN_MEM_LIMIT", "6g")
 RETRAIN_USE_ANCHOR = os.environ.get("RETRAIN_USE_ANCHOR", "1") != "0"
 
 WORKER_ENV = {
@@ -154,6 +157,7 @@ with DAG(
         network_mode=NETWORK,
         environment=WORKER_ENV,
         mounts=MOUNTS,
+        mem_limit=RETRAIN_MEM_LIMIT,
         auto_remove="success",
         mount_tmp_dir=False,
         # 5 seeds x 8 epochs; the real duration on the VM is measured in Phase 8 (CPU-bound there).

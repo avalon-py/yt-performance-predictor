@@ -654,7 +654,10 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
                bundles_dir=lb.DEFAULT_BUNDLES, deps=None, log=print):
     """Nilai kandidat dan bundle live di 10% terbaru snapshot ini; putuskan; catat; (opsional) promosikan.
 
-    Test (10% terbaru) tidak pernah dilihat kandidat (fit=trainval) maupun model live (check_no_leak).
+    Test (10% terbaru snapshot) tidak pernah dilihat kandidat (fit=trainval). Baris yang pernah dilatih model
+    live/anchor dikeluarkan lebih dulu: persis menurut id (m6_latest.split.json) bila ada, kalau tidak lewat
+    pagar waktu (check_no_leak). Dengan aturan id, sisa baris harus >= PROMOTION_MIN_UNSEEN (bawaan 300), kalau
+    tidak keputusannya "tidak dipromosikan: bukti kurang" (bukan kegagalan task).
     Keduanya dinilai lewat fungsi yang sama, masing-masing dengan scaler/genre miliknya.
 
     anchor_path: model referensi tetap; hanya dipakai bila ada bundle live (bukan --first-promotion).
@@ -685,6 +688,15 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
     tr, va, te = apply_split_to_df(df, load_canonical_split(verbose=False, spec=spec))
     targets = df["target"].values[te]
     test_start = str(df["published_at"].iloc[te].min())
+    test_ids = df["video_id"].iloc[te].tolist()
+
+    # Baris test yang pernah dilatih model live/anchor harus keluar dari perbandingan. Bila daftar id latih
+    # bundle ada (m6_latest.split.json), yang dikeluarkan persis baris itu (aturan video_id). Tanpa daftar itu,
+    # pagar waktu yang ketat dipakai (train_end bundle harus sebelum awal test). Pagar waktu saja terlalu
+    # kasar: baris yang disisipkan mundur di waktu (kanal baru, video yang baru final) menggeser awal test
+    # kandidat ke sebelum train_end live walau live tidak pernah melihat baris itu.
+    live_seen = lb.read_seen_ids(live_path) if live_path else None
+    anchor_seen = lb.read_seen_ids(anchor_path) if (live_path and anchor_path) else None
 
     pkg = run.stage_info("package")
     cand_path = Path(pkg["bundle"])
@@ -700,16 +712,17 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
         old_preds, live_meta = deps.score(live_path, df, te, data["store"], data["device"])
         live_sha = pm.sha256_file(live_path)
         live_end = live_meta.get("train_end") or (live_side or {}).get("train_end") or live_train_end
-        if live_end is None:
-            raise SystemExit("gate: bundle live tidak punya train_end (bundle lama). Berikan --live-train-end "
-                             "'<waktu publikasi terbaru di train+val bundle live>' (atau m6_latest.json dari "
-                             "`python -m early_fusion.live_bundle bootstrap`) supaya bisa dipastikan "
-                             "live tidak pernah melihat baris test.")
-        try:
-            pm.check_no_leak(live_end, test_start)
-        except ValueError as e:
-            raise SystemExit(f"gate: {e}")
-        live_train_end = str(live_end)
+        if live_seen is None:                                  # tanpa daftar id: pagar waktu yang ketat
+            if live_end is None:
+                raise SystemExit("gate: bundle live tidak punya daftar id latih (m6_latest.split.json) maupun "
+                                 "train_end. Jalankan `python -m early_fusion.live_bundle bootstrap ... "
+                                 "--split-json <split.json bundle live>` atau berikan --live-train-end "
+                                 "'<waktu publikasi terbaru di train+val bundle live>'.")
+            try:
+                pm.check_no_leak(live_end, test_start)
+            except ValueError as e:
+                raise SystemExit(f"gate: {e}")
+        live_train_end = str(live_end) if live_end is not None else None
 
         if anchor_path:
             try:
@@ -719,19 +732,25 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
             anchor_preds, anchor_meta = deps.score(anchor_path, df, te, data["store"], data["device"])
             anchor_sha = pm.sha256_file(anchor_path)
             anchor_end = anchor_meta.get("train_end") or (anchor_side or {}).get("train_end")
-            if anchor_end is None:
-                raise SystemExit("gate (anchor): bundle anchor tidak punya train_end; buat m6_anchor.json lewat "
-                                 "`python -m early_fusion.live_bundle bootstrap`")
-            try:
-                pm.check_no_leak(anchor_end, test_start)
-            except ValueError as e:
-                raise SystemExit(f"gate (anchor): {e}")
-            anchor_end = str(anchor_end)
+            if anchor_seen is None:
+                if anchor_end is None:
+                    raise SystemExit("gate (anchor): bundle anchor tidak punya daftar id latih (m6_anchor.split.json) "
+                                     "maupun train_end; buat lewat `python -m early_fusion.live_bundle bootstrap`")
+                try:
+                    pm.check_no_leak(anchor_end, test_start)
+                except ValueError as e:
+                    raise SystemExit(f"gate (anchor): {e}")
+            anchor_end = str(anchor_end) if anchor_end is not None else None
 
-    baseline = pm.linear_baseline_spearman(df.iloc[np.concatenate([tr, va])], df.iloc[te])
+    id_rule = live_seen is not None or anchor_seen is not None
+    keep = pm.unseen_mask(test_ids, live_seen, anchor_seen)
+    n_eval = int(keep.sum())
+    te_eval = te[keep]
     extra = dict(
         model_kind="m6_ensemble", run_id=run.run_id, snapshot_hash=run.stage_info("export")["snapshot_hash"],
-        n_test=int(len(te)), test_start=test_start, candidate_train_end=cand_meta.get("train_end"),
+        n_test=int(len(te)), n_evaluated=n_eval, n_excluded_seen=int(len(te) - n_eval),
+        exclusion_rule="video_id" if id_rule else "timestamp",
+        test_start=test_start, candidate_train_end=cand_meta.get("train_end"),
         candidate_sha256=pkg["sha256"], n_members=len(run.stage_info("train")["seeds"]),
         live_path=str(live_path) if live_path else None, live_sha256=live_sha, live_train_end=live_train_end,
         baseline_fit="train+val", bootstrap_seed=pm.BOOTSTRAP_SEED,
@@ -740,15 +759,22 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
         extra.update(anchor_path=str(anchor_path), anchor_sha256=anchor_sha, anchor_train_end=anchor_end)
     if dev:
         extra["deviations"] = dev
-    decision = pm.decide(new_preds=new_preds, targets=targets, baseline_spearman=baseline,
-                         old_preds=old_preds, first_promotion=first_promotion,
-                         versioned_path=cand_path, extra=extra, anchor_preds=anchor_preds)
+    baseline = None
+    if id_rule and n_eval < pm.MIN_UNSEEN:                     # terlalu sedikit baris adil: bukan bukti, jangan promosi
+        decision = pm.insufficient_evidence(versioned_path=cand_path, n_test=len(te), n_evaluated=n_eval,
+                                            min_unseen=pm.MIN_UNSEEN, extra=extra)
+    else:
+        baseline = pm.linear_baseline_spearman(df.iloc[np.concatenate([tr, va])], df.iloc[te_eval])
+        decision = pm.decide(new_preds=new_preds[keep], targets=targets[keep], baseline_spearman=baseline,
+                             old_preds=None if old_preds is None else old_preds[keep],
+                             first_promotion=first_promotion, versioned_path=cand_path, extra=extra,
+                             anchor_preds=None if anchor_preds is None else anchor_preds[keep])
 
     decision.update(promote_requested=bool(promote), applied=False)
     apply_error = None
     if promote and decision["promoted"]:
         try:
-            applied = lb.promote(cand_path, bundles_dir)
+            applied = lb.promote(cand_path, bundles_dir, split_json=run.split_path)
             decision.update(applied=True, applied_latest=applied["latest"], applied_prev=applied["prev"])
         except Exception as e:                       # dicatat apa adanya, lalu task digagalkan di bawah
             decision.update(applied=False, apply_error=repr(e))
@@ -762,8 +788,10 @@ def stage_gate(run, *, store_dir, live_path=None, first_promotion=False, live_tr
           if "ci_lower" in decision else "")
     anc = (f" anchor={decision['anchor_spearman']:.4f} CI=[{decision['anchor_ci_lower']:.4f}, "
            f"{decision['anchor_ci_upper']:.4f}] margin={decision['anchor_margin']}" if "anchor_ci_lower" in decision else "")
-    log(f"[gate] {verdict} -- {decision['reason']} | new={decision['new_spearman']:.4f} "
-        f"old={decision.get('old_spearman', float('nan')):.4f} baseline={baseline:.4f}{ci}{anc}")
+    f4 = lambda x: "n/a" if x is None else f"{float(x):.4f}"
+    log(f"[gate] {verdict} -- {decision['reason']} | new={f4(decision.get('new_spearman'))} "
+        f"old={f4(decision.get('old_spearman'))} baseline={f4(baseline)} "
+        f"rows={decision.get('n_evaluated', n_eval)}/{len(te)} ({extra['exclusion_rule']}){ci}{anc}")
     log(f"[gate] dicatat di {log_path}")
     if apply_error is not None:
         raise RuntimeError(f"gate: keputusan PROMOTE, tetapi bundle gagal diganti: {apply_error!r} "

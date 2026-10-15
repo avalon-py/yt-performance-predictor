@@ -92,6 +92,14 @@ def test_docker_operator_pushes_all_lines_and_has_a_timeout():
     assert _kw(call, "execution_timeout") is not None and "RETRAIN_TIMEOUT_HOURS" in DAG_SRC
 
 
+def test_worker_has_a_memory_cap_and_a_timeout_that_fits_the_measured_run():
+    """Benchmark VM: 5 seed x 8 epoch sekitar 8 jam pada 1 thread; data tumbuh tiap bulan -> timeout 14 jam."""
+    call = _docker_operator_call()
+    assert ast.unparse(_kw(call, "mem_limit")) == "RETRAIN_MEM_LIMIT"
+    assert 'os.environ.get("RETRAIN_MEM_LIMIT", "6g")' in DAG_SRC
+    assert 'int(os.environ.get("RETRAIN_TIMEOUT_HOURS", "14"))' in DAG_SRC
+
+
 def test_worker_environment_and_mounts_cover_what_retraining_touches():
     for key in ("POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB",
                 "MINIO_ENDPOINT", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD"):
